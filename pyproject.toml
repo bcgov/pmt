@@ -1,0 +1,90 @@
+[tool.poetry]
+name = "python-microservice-template"
+version = "0.0.1"
+description = "A high-performance async microservice template using FastAPI, Redis Streams, PostgreSQL, and clean architecture."
+authors = ["alvesfc <alvesfc@prootnmail.com>"]
+license = "MIT"
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.14"
+
+# --- Web Framework ---
+fastapi = "^ 0.122.0"
+uvicorn = { extras = ["standard"], version = "^0.38.0" }
+
+# --- Database / ORM ---
+sqlalchemy = "^2.0.44"
+asyncpg = "^0.31.0"
+
+# --- Redis ---
+redis = "^7.1.0"
+
+# --- Config ---
+pydantic-settings = "^2.12.0"
+
+# --- Utilities ---
+python-dotenv = "^1.2.1"
+
+# --- Database Migrations ---
+alembic = "^1.16.0"
+
+# Optional: Logging/Tracing
+structlog = "^25.5.0"
+opentelemetry-api = "^1.38.0"
+opentelemetry-sdk = "^1.38.0"
+opentelemetry-exporter-otlp = "^1.38.0"
+opentelemetry-instrumentation-fastapi = "^0.59b0"
+opentelemetry-instrumentation-logging = "^0.59b0"
+opentelemetry-semantic-conventions = "^0.59b0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.1"
+pytest-asyncio = "^1.3.0"
+pytest-cov = "^7.0.0"
+ruff = "^0.14.6"
+black = "^25.11.0"
+testcontainers = { extras = ["postgres", "redis"], version = "^4.9.0" }
+httpx = "^0.28.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+# -----------------------------
+# Formatting & Linting (Optional)
+# -----------------------------
+
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "I"]
+ignore = ["E501", "B008"]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+markers = [
+    "integration: requires Docker (Postgres + Redis testcontainers)",
+]
+
+[tool.coverage.run]
+source = ["."]
+omit = [
+    "tests/*",
+    "db/migrations/versions/*",
+    ".venv/*",
+]
+
+[tool.coverage.report]
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
