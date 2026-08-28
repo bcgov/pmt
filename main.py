@@ -1,38 +1,51 @@
-# pmt/main.py
+# main.py
+"""
+Worker entry point.
+
+Two coroutines on one event loop: the Redis Streams consumer, and a health
+probe server so an orchestrator can ask how it is doing. There is no HTTP API
+— this process exists to consume events.
+"""
 
 import asyncio
-from contextlib import asynccontextmanager
+import signal
 
-from fastapi import FastAPI
-
-from api.routes import health, info, orders
 from config.logging import configure_logging, get_logger
-from config.request_logger import RequestLoggingMiddleware
 from config.tracing import init_tracing
-from db.postgres.session import close_db
+from health.server import start_health_server
 from messaging.consumer import RedisConsumer
 from messaging.producer.redis_producer import close_producer
+from messaging.state import close_state_client
 
 configure_logging()
+init_tracing()
 
 logger = get_logger(__name__)
 
-# Global consumer instance
-consumer = None
-consumer_task = None
+# How long a handler gets to finish its current message once shutdown starts.
+# Keep it under your orchestrator's grace period, or SIGKILL wins the race.
+SHUTDOWN_TIMEOUT_SECONDS = 10
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
+def _install_signal_handlers(stop: asyncio.Event) -> None:
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except NotImplementedError:
+            # Not available on every platform; Ctrl-C still raises
+            # KeyboardInterrupt, which asyncio.run handles.
+            pass
+
+
+async def run_worker(stop: asyncio.Event | None = None) -> None:
     """
-    Start the Redis consumer alongside the API.
+    Run until signalled, then shut down without dropping an in-flight message.
 
-    The schema is NOT created here — run `alembic upgrade head` (the compose
-    entrypoint and `make migrate` both do).
+    `stop` is injectable so tests can drive shutdown without sending signals.
     """
-    global consumer, consumer_task
-
-    logger.info("Starting application")
+    stop = stop or asyncio.Event()
+    _install_signal_handlers(stop)
 
     consumer = RedisConsumer()
     consumer_task = asyncio.create_task(consumer.start())
@@ -43,92 +56,42 @@ async def lifespan(app: FastAPI):
             else None
         )
     )
-    logger.info("Redis Stream consumer started")
 
-    yield
+    server = await start_health_server()
+    logger.info("Worker started")
 
-    logger.info("Shutting down application")
+    # If the consumer dies on its own, stop waiting — a worker whose consumer
+    # is dead but whose health server still answers is the worst outcome.
+    consumer_task.add_done_callback(lambda _: stop.set())
 
-    if consumer:
-        await consumer.stop()
-    if consumer_task:
-        try:
-            # Let the in-flight message finish before giving up on it.
-            await asyncio.wait_for(consumer_task, timeout=10)
-        except TimeoutError:
-            logger.warning("Consumer did not stop in time; cancelling")
-            consumer_task.cancel()
-            await asyncio.gather(consumer_task, return_exceptions=True)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            # Whatever killed the consumer task must not skip the cleanup
-            # below (producer/db close) — that's a resource leak.
-            logger.error("Consumer task ended with error", error=str(e))
-    if consumer:
-        await consumer.close()
-    logger.info("Redis Stream consumer stopped")
+    await stop.wait()
+    logger.info("Shutting down worker")
 
+    await consumer.stop()
+    try:
+        await asyncio.wait_for(consumer_task, timeout=SHUTDOWN_TIMEOUT_SECONDS)
+    except TimeoutError:
+        logger.warning("Consumer did not stop in time; cancelling")
+        consumer_task.cancel()
+        await asyncio.gather(consumer_task, return_exceptions=True)
+    except asyncio.CancelledError:
+        pass
+    except Exception as e:
+        # Whatever killed the consumer must not skip the cleanup below —
+        # that would be a resource leak.
+        logger.error("Consumer task ended with error", error=str(e))
+
+    server.close()
+    await server.wait_closed()
+
+    await consumer.close()
     await close_producer()
-    await close_db()
-    logger.info("Connections closed")
+    await close_state_client()
+    logger.info("Worker stopped; connections closed")
 
 
-app = FastAPI(
-    title="Python Microservice Template Service",
-    version="1.0.0",
-    description="Python Microservice Template API",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
-    lifespan=lifespan,
-)
-
-app.add_middleware(RequestLoggingMiddleware)
-
-# OTEL tracing
-init_tracing(app)
-
-# -----------------------------------------------------------
-# Middleware
-# -----------------------------------------------------------
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=settings.CORS_ALLOW_ORIGINS,
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-
-# -----------------------------------------------------------
-# Routers
-# -----------------------------------------------------------
-app.include_router(health.router)
-app.include_router(info.router)
-app.include_router(orders.router)
-
-
-# -----------------------------------------------------------
-# Root Endpoint
-# -----------------------------------------------------------
-@app.get("/", tags=["root"])
-async def root():
-    return {"message": "Python Microservice Template API is running"}
-
-
-# -----------------------------------------------------------
-# Main function (run with: python -m pmt.main)
-# -----------------------------------------------------------
-def main():
-    import uvicorn
-
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8099,
-        reload=True,
-    )
+def main() -> None:
+    asyncio.run(run_worker())
 
 
 if __name__ == "__main__":

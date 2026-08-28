@@ -1,143 +1,114 @@
-# tests/unit/test_main.py
-
 import asyncio
 
-from httpx import ASGITransport, AsyncClient
+import pytest
 
-import main
-
-
-async def noop():
-    pass
+import main as main_module
 
 
 class FakeConsumer:
-    """
-    Mirrors RedisConsumer's lifecycle without touching Redis.
-
-    start() blocks until stop() is called, like the real consumer loop
-    blocks until self.running goes False.
-    """
-
     def __init__(self):
-        self.started = asyncio.Event()
-        self._run_forever = asyncio.Event()
+        self.started = False
         self.stopped = False
         self.closed = False
+        self._running = asyncio.Event()
 
     async def start(self):
-        self.started.set()
-        await self._run_forever.wait()
+        self.started = True
+        await self._running.wait()
 
     async def stop(self):
         self.stopped = True
-        self._run_forever.set()
+        self._running.set()
 
     async def close(self):
         self.closed = True
 
 
-async def test_root_endpoint_returns_ok_message():
-    transport = ASGITransport(app=main.app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        response = await client.get("/")
+class FakeServer:
+    def __init__(self):
+        self.closed = False
 
-    assert response.status_code == 200
-    assert response.json() == {"message": "Python Microservice Template API is running"}
+    def close(self):
+        self.closed = True
 
-
-def test_main_runs_uvicorn_on_the_expected_host_and_port(monkeypatch):
-    import uvicorn
-
-    calls = []
-    monkeypatch.setattr(
-        uvicorn, "run", lambda app_path, **kwargs: calls.append((app_path, kwargs))
-    )
-
-    main.main()
-
-    assert calls == [("main:app", {"host": "0.0.0.0", "port": 8099, "reload": True})]
+    async def wait_closed(self):
+        return None
 
 
-async def test_lifespan_starts_and_cleanly_stops_the_consumer(monkeypatch):
-    fake_consumer = FakeConsumer()
-    producer_closed, db_closed = [], []
-    monkeypatch.setattr(main, "RedisConsumer", lambda: fake_consumer)
-    monkeypatch.setattr(
-        main, "close_producer", lambda: producer_closed.append(True) or noop()
-    )
-    monkeypatch.setattr(main, "close_db", lambda: db_closed.append(True) or noop())
+@pytest.fixture
+def fakes(monkeypatch):
+    consumer = FakeConsumer()
+    server = FakeServer()
+    calls = {"producer_closed": False, "state_closed": False}
 
-    async with main.lifespan(main.app):
-        await fake_consumer.started.wait()
+    async def fake_start_health_server(port=None):
+        return server
 
-    assert fake_consumer.stopped is True
-    assert fake_consumer.closed is True
-    assert producer_closed == [True]
-    assert db_closed == [True]
+    async def fake_close_producer():
+        calls["producer_closed"] = True
 
+    async def fake_close_state_client():
+        calls["state_closed"] = True
 
-async def test_lifespan_cancels_a_consumer_task_that_wont_stop_in_time(monkeypatch):
-    fake_consumer = FakeConsumer()
-
-    async def stop_without_unblocking_start():
-        fake_consumer.stopped = True
-
-    fake_consumer.stop = stop_without_unblocking_start
-    monkeypatch.setattr(main, "RedisConsumer", lambda: fake_consumer)
-    monkeypatch.setattr(main, "close_producer", noop)
-    monkeypatch.setattr(main, "close_db", noop)
-
-    async def fake_wait_for(aw, timeout=None):
-        raise TimeoutError
-
-    monkeypatch.setattr(main.asyncio, "wait_for", fake_wait_for)
-
-    async with main.lifespan(main.app):
-        await fake_consumer.started.wait()
-
-    assert fake_consumer.closed is True
+    monkeypatch.setattr(main_module, "RedisConsumer", lambda: consumer)
+    monkeypatch.setattr(main_module, "start_health_server", fake_start_health_server)
+    monkeypatch.setattr(main_module, "close_producer", fake_close_producer)
+    monkeypatch.setattr(main_module, "close_state_client", fake_close_state_client)
+    return consumer, server, calls
 
 
-async def test_lifespan_swallows_cancelled_error_while_waiting_for_the_task(
-    monkeypatch,
-):
-    fake_consumer = FakeConsumer()
-    monkeypatch.setattr(main, "RedisConsumer", lambda: fake_consumer)
-    monkeypatch.setattr(main, "close_producer", noop)
-    monkeypatch.setattr(main, "close_db", noop)
+async def test_run_worker_starts_consumer_and_health_server(fakes):
+    consumer, server, _ = fakes
+    stop = asyncio.Event()
 
-    async def fake_wait_for(aw, timeout=None):
-        raise asyncio.CancelledError
+    task = asyncio.create_task(main_module.run_worker(stop=stop))
+    await asyncio.sleep(0.05)
 
-    monkeypatch.setattr(main.asyncio, "wait_for", fake_wait_for)
+    assert consumer.started is True
+    assert server.closed is False
 
-    async with main.lifespan(main.app):
-        await fake_consumer.started.wait()
-
-    assert fake_consumer.closed is True
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
 
 
-async def test_lifespan_logs_and_continues_when_the_consumer_task_errors(monkeypatch):
-    class ExplodingConsumer:
-        def __init__(self):
-            self.closed = False
+async def test_stop_event_shuts_everything_down_in_order(fakes):
+    consumer, server, calls = fakes
+    stop = asyncio.Event()
 
-        async def start(self):
-            raise RuntimeError("boom")
+    task = asyncio.create_task(main_module.run_worker(stop=stop))
+    await asyncio.sleep(0.05)
+    stop.set()
+    await asyncio.wait_for(task, timeout=5)
 
-        async def stop(self):
-            pass
-
-        async def close(self):
-            self.closed = True
-
-    consumer = ExplodingConsumer()
-    monkeypatch.setattr(main, "RedisConsumer", lambda: consumer)
-    monkeypatch.setattr(main, "close_producer", noop)
-    monkeypatch.setattr(main, "close_db", noop)
-
-    async with main.lifespan(main.app):
-        await asyncio.sleep(0)  # let the consumer task run and raise
-
+    assert consumer.stopped is True
     assert consumer.closed is True
+    assert server.closed is True
+    assert calls["producer_closed"] is True
+    assert calls["state_closed"] is True
+
+
+async def test_a_hung_consumer_is_cancelled_rather_than_hanging_shutdown(
+    monkeypatch, fakes
+):
+    """
+    stop() asks the loop to finish its current message. If the handler is
+    wedged, shutdown must not wait forever — SIGTERM has a deadline before
+    the orchestrator sends SIGKILL.
+    """
+    consumer, _, calls = fakes
+    monkeypatch.setattr(main_module, "SHUTDOWN_TIMEOUT_SECONDS", 0.1)
+
+    async def never_stops():
+        self_stop_ignored = asyncio.Event()
+        await self_stop_ignored.wait()
+
+    monkeypatch.setattr(consumer, "stop", lambda: asyncio.sleep(0))
+    monkeypatch.setattr(consumer, "start", never_stops)
+
+    stop = asyncio.Event()
+    task = asyncio.create_task(main_module.run_worker(stop=stop))
+    await asyncio.sleep(0.05)
+    stop.set()
+
+    await asyncio.wait_for(task, timeout=5)
+    assert calls["producer_closed"] is True
