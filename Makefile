@@ -1,20 +1,17 @@
-.PHONY: up down logs migrate revision test test-all lint fmt demo
+.PHONY: up down logs test test-all lint fmt demo health
 
-up:                ## Start Postgres, Redis and the API (runs migrations first)
+up:                ## Start Redis and the worker
 	docker compose up --build -d
-	@echo "API on http://localhost:8000/docs"
+	@echo "Worker health on http://localhost:8000/health"
 
 down:
 	docker compose down
 
 logs:
-	docker compose logs -f api
+	docker compose logs -f worker
 
-migrate:           ## Apply migrations against the running database
-	docker compose exec api alembic upgrade head
-
-revision:          ## make revision m="add a column"
-	docker compose exec api alembic revision --autogenerate -m "$(m)"
+health:
+	@curl -s -i http://localhost:8000/health
 
 test:              ## Unit tests only — no Docker required
 	poetry run pytest -m "not integration" --junitxml=reports/junit.xml --cov=. --cov-report=xml:reports/coverage.xml --cov-report=html:reports/htmlcov
@@ -28,12 +25,13 @@ lint:
 fmt:
 	poetry run black . && poetry run ruff check --fix .
 
-demo:              ## Watch one order go pending -> confirmed
-	@echo "--- POST /orders"
-	@curl -s -X POST http://localhost:8000/orders \
-		-H 'Content-Type: application/json' \
-		-d '{"order_ref":"demo-1","item":"widget","quantity":3}' | python3 -m json.tool
+demo:              ## Publish one order twice; watch it confirm exactly once
+	@echo "--- publishing OrderCreated x2 (same ref)"
+	@docker compose exec worker python -m cli publish \
+		--ref demo-1 --item widget --quantity 3 --unit-price-cents 450 --count 2
 	@echo "--- waiting for the consumer..."
-	@sleep 2
-	@echo "--- GET /orders/demo-1"
-	@curl -s http://localhost:8000/orders/demo-1 | python3 -m json.tool
+	@sleep 3
+	@echo "--- state in Redis"
+	@docker compose exec redis redis-cli -a redis --no-auth-warning -n 1 HGETALL order:demo-1
+	@echo "--- worker log (one confirm, one already-processed, one confirmation received)"
+	@docker compose logs --tail=30 worker

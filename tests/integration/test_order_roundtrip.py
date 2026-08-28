@@ -1,56 +1,107 @@
-# tests/integration/test_order_roundtrip.py
-
 import asyncio
 
 import pytest
-from httpx import ASGITransport, AsyncClient
 
-from messaging.consumer import RedisConsumer
+import cli
+from messaging.consumer.redis_consumer import RedisConsumer
+from messaging.models import EventEnvelope, OrderConfirmedEvent
+from messaging.producer.redis_producer import close_producer
+from messaging.state import close_state_client
 
 pytestmark = pytest.mark.integration
 
 
-@pytest.fixture
-async def running_consumer(app_settings, migrated_db, redis_client):
-    """A live consumer for the duration of one test."""
-    consumer = RedisConsumer(consumer_name="roundtrip")
+@pytest.fixture(autouse=True)
+async def _close_clients(app_settings):
+    yield
+    await close_state_client()
+    await close_producer()
+
+
+async def drain(consumer: RedisConsumer, passes: int = 2) -> None:
+    """Read and handle whatever is pending, `passes` times."""
+    for _ in range(passes):
+        response = await consumer.redis.xreadgroup(
+            groupname=consumer.consumer_group,
+            consumername=consumer.consumer_name,
+            streams={consumer.stream_name: ">"},
+            count=10,
+            block=500,
+        )
+        for _stream, messages in response or []:
+            for message_id, fields in messages:
+                await consumer._handle_one(message_id, fields)
+
+
+async def test_cli_publish_flows_through_both_hops(app_settings, redis_client):
+    """
+    The whole pipeline: CLI publishes OrderCreated twice, the consumer confirms
+    once, computes the total, publishes exactly one OrderConfirmed, and handles
+    that too. Two events in, one event out.
+    """
+    args = cli.build_parser().parse_args(
+        [
+            "publish",
+            "--ref",
+            "demo-1",
+            "--item",
+            "widget",
+            "--quantity",
+            "3",
+            "--unit-price-cents",
+            "450",
+            "--count",
+            "2",
+        ]
+    )
+    await cli.publish(args)
+
+    consumer = RedisConsumer()
     await consumer.ensure_group()
-    task = asyncio.create_task(consumer.start())
-    yield consumer
-    await consumer.stop()
-    await asyncio.wait_for(task, timeout=10)
+    await drain(consumer, passes=3)
     await consumer.close()
 
+    stored = await redis_client.hgetall("order:demo-1")
+    assert stored["status"] == "confirmed"
+    assert stored["total_cents"] == "1350"
 
-async def test_order_goes_from_pending_to_confirmed(
-    app_settings, running_consumer, redis_client, db_session
-):
-    """
-    POST /orders -> row committed pending + event published -> consumer
-    confirms it -> GET shows confirmed. The whole template in one test.
-    """
-    from main import app
+    entries = await redis_client.xrange(app_settings.STREAM_NAME)
+    confirmed = [
+        EventEnvelope.model_validate_json(fields["event"])
+        for _id, fields in entries
+        if EventEnvelope.model_validate_json(fields["event"]).event_type
+        == "OrderConfirmed"
+    ]
+    assert len(confirmed) == 1
+    assert isinstance(confirmed[0].payload, OrderConfirmedEvent)
+    assert confirmed[0].payload.total_cents == 1350
 
-    transport = ASGITransport(app=app)
-    async with AsyncClient(transport=transport, base_url="http://test") as client:
-        created = await client.post(
-            "/orders",
-            json={"order_ref": "rt-1", "item": "widget", "quantity": 4},
-        )
-        assert created.status_code == 201
-        assert created.json()["status"] == "pending"
+    pending = await redis_client.xpending(
+        app_settings.STREAM_NAME, app_settings.CONSUMER_GROUP
+    )
+    assert pending["pending"] == 0, "every message must be acked"
 
-        status_seen = None
-        for _ in range(50):  # up to ~5s
-            await asyncio.sleep(0.1)
-            response = await client.get("/orders/rt-1")
-            assert response.status_code == 200
-            status_seen = response.json()["status"]
-            if status_seen == "confirmed":
-                break
 
-        assert status_seen == "confirmed", "consumer never confirmed the order"
-        assert response.json()["confirmed_at"] is not None
+async def test_nothing_lands_in_the_dlq_on_the_happy_path(app_settings, redis_client):
+    args = cli.build_parser().parse_args(
+        [
+            "publish",
+            "--ref",
+            "demo-2",
+            "--item",
+            "widget",
+            "--quantity",
+            "1",
+            "--unit-price-cents",
+            "1000",
+        ]
+    )
+    await cli.publish(args)
 
-    # Nothing failed along the way.
+    consumer = RedisConsumer()
+    await consumer.ensure_group()
+    await drain(consumer, passes=3)
+    await consumer.close()
+
     assert await redis_client.xlen(app_settings.dlq_stream) == 0
+    await asyncio.sleep(0)
