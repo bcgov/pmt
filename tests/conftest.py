@@ -10,6 +10,13 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from testcontainers.postgres import PostgresContainer
 from testcontainers.redis import RedisContainer
 
+# Unit tests import main, which builds Settings at import time. DATABASE_URL
+# has no default and a fresh clone has no .env, so supply a placeholder that
+# nothing ever connects to. app_settings overwrites it with the container URL.
+os.environ.setdefault(
+    "DATABASE_URL", "postgresql+asyncpg://test:test@localhost:5432/test"
+)
+
 
 @pytest.fixture(scope="session")
 def postgres_url() -> str:
