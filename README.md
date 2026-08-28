@@ -1,106 +1,160 @@
-# Python Microservice Template
+# Python Microservice Template — Redis Streams
 
-An async FastAPI microservice template with a working reference slice: an
-`orders` API backed by PostgreSQL, publishing and consuming events over Redis
-Streams. Read it end to end, then replace the slice with your own domain.
+An async worker template with a working reference pipeline: a CLI publishes an
+event, a consumer picks it up, computes a result, and publishes a follow-on
+event — all under one distributed trace. Read it end to end, then replace the
+sample events with your own.
+
+There is no HTTP API and no database. This is a message-processing service.
 
 ---
 
 ## Quickstart
 
 ```bash
-make up      # docker compose up --build -d; runs migrations, starts the API
-make demo    # POST an order, wait for the consumer, GET it back
+make up      # docker compose up --build -d; starts Redis and the worker
+make demo    # publish one order twice; watch it confirm exactly once
 ```
 
 Expected output:
 
 ```
---- POST /orders
-{
-    "order_ref": "demo-1",
-    "item": "widget",
-    "quantity": 3,
-    "status": "pending",
-    ...
-}
+--- publishing OrderCreated x2 (same ref)
+published 2 x OrderCreated ref=demo-1 qty=3 unit=4.50 expected_total=13.50
+  1735300000000-0
+  1735300000000-1
 --- waiting for the consumer...
---- GET /orders/demo-1
-{
-    "order_ref": "demo-1",
-    "item": "widget",
-    "quantity": 3,
-    "status": "confirmed",
-    ...
-}
+--- state in Redis
+status
+confirmed
+item
+widget
+quantity
+3
+total_cents
+1350
+--- worker log
+... "Order confirmed" total=13.50
+... "Order already processed; nothing to do"
+... "Order confirmation received" total=13.50
 ```
 
-The order starts `pending` and is `confirmed` by the time you fetch it.
-Interactive API docs are at [http://localhost:8000/docs](http://localhost:8000/docs).
+Two events in, one confirmation out. The second delivery is a logged no-op —
+that is the idempotency guard doing its job, not a bug.
 
 ---
 
 ## What the demo does
 
 ```
-POST /orders {order_ref, item, quantity}
-  └→ INSERT orders (status=pending)          [request-scoped session]
-  └→ XADD order.events "OrderCreated"
-                                             → 201 {status: "pending"}
+python -m cli publish --ref demo-1 --quantity 3 --unit-price-cents 450 --count 2
+  └→ XADD order.events "OrderCreated"   x2
 
-[consumer] XREADGROUP
-  └→ handler: UPDATE orders
-       SET status='confirmed', confirmed_at=now()
-       WHERE order_ref=:ref AND status='pending'   [own session]
+[worker] XREADGROUP → OrderCreated (1st)
+  └→ HSETNX order:demo-1 status confirmed → 1
+  └→ total_cents = 3 * 450 = 1350        [the processing step]
+  └→ XADD order.events "OrderConfirmed" {total_cents: 1350}
   └→ XACK
 
-GET /orders/{order_ref} → {status: "confirmed"}
+[worker] XREADGROUP → OrderCreated (2nd)
+  └→ HSETNX → 0 → "already processed", publishes nothing
+  └→ XACK
+
+[worker] XREADGROUP → OrderConfirmed
+  └→ log; XACK
 ```
 
-The API writes the row and publishes an event in the same request; the
-consumer, running as a background task inside the same process, reads that
-event and moves the order to `confirmed`. Nothing in the API itself sets
-`confirmed` — that only happens on the consumer side, so you're watching a
-real asynchronous handoff, not a synchronous illusion.
+The consumer is both a consumer and a producer. That middle hop is the point of
+the template: consume → compute → publish is the shape most real services take.
+
+---
+
+## One trace across both hops
+
+Trace context rides in a `traceparent` field on the envelope. The producer
+injects whatever span is current; the consumer extracts it and makes its
+message span current, so anything a handler publishes is automatically a child
+of the message being handled:
+
+```
+[cli.publish]                              (cli process, root)
+  └── [publish OrderCreated]
+        └── [consume OrderCreated]         (worker)
+              └── [publish OrderConfirmed]
+                    └── [consume OrderConfirmed]
+```
+
+Point `OTEL_EXPORTER_OTLP_ENDPOINT` at a collector to see it, or set
+`OTEL_EXPORTER_OTLP_ENDPOINT_ENABLE_FALLBACK=True` to dump spans to the console.
+
+The single rule to preserve if you touch this: the consumer's span must be
+made **current** (`start_as_current_span`), not held detached. A detached span
+looks identical in the logs and silently orphans every downstream hop.
+
+---
+
+## Health
+
+The worker serves one endpoint, on `HEALTH_PORT` (8000 in compose):
+
+```bash
+make health     # 200 {"status":"ok","redis":"ok"} or 503 {"status":"degraded",...}
+```
+
+It is about forty lines of `asyncio.start_server` in `health/server.py`, not a
+web framework. There is no `/info` — `SERVICE_NAME`, `SERVICE_VERSION` and
+`ENVIRONMENT` are stamped on every exported span as resource attributes, so
+the collector already has them.
+
+---
+
+## Money
+
+Amounts are integer minor units everywhere: `450` means `4.50`, and the field
+name carries the unit (`unit_price_cents`, `total_cents`). Never floats.
+Formatting to a human-readable string happens only at output edges, via
+`format_cents()` in `money.py` — payload models carry ints, so the wire format
+never depends on presentation.
+
+---
+
+## What this template does not solve
+
+The handler writes its state and then publishes. Those two steps are not
+atomic: if the publish fails after the state write, the retry sees the
+idempotency guard and skips the publish, so the downstream event is lost. This
+is the write-then-publish problem, and the real answer is a transactional
+outbox — persist the outgoing event in the same write as the state, and let a
+separate relay drain it to the stream.
+
+That is deliberately not implemented here. It roughly doubles the moving parts,
+and a template's job is to make the mechanism legible. The failure is named in
+`messaging/consumer/handlers/order_created.py` so nobody meets it by surprise.
 
 ---
 
 ## Make it yours
 
-The `orders` slice exists to be replaced. Edit these seven files, in order:
+The sample events exist to be replaced. Edit these four places, in order:
 
-1. `db/models.py` — your entity, in place of `Order`.
-2. `db/repositories/order_repository.py` — your queries.
-3. `messaging/models/events/order_created.py` — your event payload.
-4. `messaging/models/envelope.py` — add your event type to the `Literal` and
-   to `EventPayload`.
-5. `messaging/consumer/handlers/order_created.py` — your handler.
-6. `messaging/consumer/dispatcher.py` — register the handler in `HANDLERS`.
-7. `core/services/order_service.py` and `api/routes/orders.py` — your service
-   and routes.
+1. `messaging/models/events/` — your payloads, in place of `OrderCreatedEvent`
+   and `OrderConfirmedEvent`.
+2. `messaging/models/envelope.py` — add your event types to the `Literal` and
+   to the `EventPayload` union.
+3. `messaging/consumer/handlers/` — your handlers.
+4. `messaging/consumer/dispatcher.py` — register them in `HANDLERS`.
 
-Then generate and apply a migration for your table:
+`OrderConfirmed` is a worked example of exactly that four-file edit; follow it.
 
-```bash
-make revision m="create <your table>"
-make migrate
-```
+Two rules to keep when you do:
 
----
-
-## Migrations
-
-Schema changes go through Alembic only — there is no `create_all` anywhere in
-this codebase, and the app does not create tables on startup. The schema has
-exactly one source of truth: the revisions in `db/migrations/versions/`.
-
-```bash
-make revision m="add a column"   # autogenerate a revision from your models
-make migrate                      # alembic upgrade head
-```
-
-The compose entrypoint runs `alembic upgrade head` before starting uvicorn, so
-`make up` always leaves the database at the latest revision.
+- **Handlers must be idempotent.** Redis Streams delivers at least once.
+  Guard with a conditional write, and put the early return *before* any
+  publish — otherwise one redelivery amplifies through every downstream
+  consumer.
+- **Do not publish upstream from a handler.** Both sample events share one
+  stream; a handler that republishes what it consumes is an infinite loop that
+  looks like a busy worker.
 
 ---
 
@@ -129,27 +183,6 @@ To inspect the DLQ:
 docker compose exec redis redis-cli -a redis XRANGE order.events:dlq - +
 ```
 
-Because delivery is at-least-once, handlers must be idempotent. The order
-handler's update is conditional
-(`WHERE order_ref=:ref AND status='pending'`); a redelivered message affects
-zero rows, logs it, and acks normally.
-
----
-
-## Known limitation: no transactional outbox
-
-The database commit and the `XADD` publish are two separate operations, not
-one atomic unit. If the commit succeeds but the publish fails, the API still
-returns `201` with `status: "pending"` — the row is real, the event is not,
-and the response reflects that truthfully rather than pretending otherwise.
-
-A production service closes this gap with a transactional outbox: write the
-event to an outbox table in the same transaction as the domain row, then have
-a separate relay process poll the outbox and publish, marking rows as sent.
-This template omits it deliberately — it adds a second table and a second
-background loop, roughly doubling the code for a reference slice whose job is
-to demonstrate the event flow clearly, not to be production-hardened.
-
 ---
 
 ## Testing
@@ -159,9 +192,8 @@ make test       # poetry run pytest -m "not integration" — no Docker required
 make test-all   # poetry run pytest — includes testcontainers-backed integration tests
 ```
 
-`make test` runs the unit suite (service sequencing, dispatcher routing,
-handler logic) with everything mocked, so it works without Docker. `make
-test-all` additionally spins up real Postgres and Redis via testcontainers and
-runs the round-trip test (`POST /orders` → poll `GET` until `confirmed`), a
-DLQ test, and a migration up/down/up test — this is the suite that actually
-proves the template works.
+`make test` runs the unit suite (dispatcher routing, envelope validation,
+money formatting, worker lifecycle) with nothing external required, so it works
+without Docker. `make test-all` additionally spins up a real Redis via
+testcontainers and runs the handler, health, tracing, CLI and round-trip
+tests — this is the suite that actually proves the template works.
