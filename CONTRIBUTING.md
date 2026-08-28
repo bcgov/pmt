@@ -9,8 +9,8 @@ conventions are a reasonable starting point but yours to change.
 
 ```bash
 poetry install       # install dependencies
-make up               # docker compose up --build -d; runs migrations, starts the API
-make demo             # POST an order, wait for the consumer, GET it back
+make up              # docker compose up --build -d; starts Redis and the worker
+make demo            # publish one order twice; watch it confirm exactly once
 ```
 
 See [README.md](README.md) for the full quickstart and
@@ -27,9 +27,9 @@ make test-all   # full suite, including testcontainers integration tests
 
 `make test-all` is required, not optional, before opening a PR — see
 ["Why testing locally with Docker matters"](BEST_PRACTICES.md#4-testing-strategy-unit-vs-integration)
-in `BEST_PRACTICES.md`. The unit suite mocks Postgres and Redis; only the
-full suite (or `make up && make demo`) proves the change works against the
-real dependencies.
+in `BEST_PRACTICES.md`. The unit suite never touches Redis; only the full
+suite (or `make up && make demo`) proves the change works against the real
+dependency.
 
 ## Code style
 
@@ -41,41 +41,59 @@ real dependencies.
 - No comments explaining *what* code does — names should already make that
   clear. A comment is only worth adding for a non-obvious *why* (a hidden
   constraint, a workaround, something that would surprise a reader).
-
-## Database changes
-
-Schema changes go through Alembic exclusively — there is no `create_all`
-anywhere in this codebase.
-
-```bash
-make revision m="describe the change"   # alembic revision --autogenerate
-make migrate                             # alembic upgrade head
-```
-
-Every revision must implement a working `downgrade()`.
-`tests/integration/test_migrations.py` exercises
-`upgrade head → downgrade base → upgrade head` and will fail if it doesn't.
+- Money is integer minor units everywhere, with a `_cents` suffix on the
+  field name. Never `float`, never `Decimal`; format only at output edges,
+  via `format_cents()` in `money.py`.
 
 ## Adding a new event type
 
 1. Add the payload model under `messaging/models/events/`.
 2. Add the event type to the `Literal` and to the `EventPayload` union in
    `messaging/models/envelope.py`.
-3. Write a handler under `messaging/consumer/handlers/`. Handlers must be
-   idempotent — Redis Streams delivery is at-least-once, and redelivery is
-   expected, not a bug.
+3. Write a handler under `messaging/consumer/handlers/`.
 4. Register the handler in `HANDLERS` in
    `messaging/consumer/dispatcher.py`.
 
+`OrderConfirmed` is a worked example of exactly that four-file edit; follow
+it. Two rules a new handler must respect:
+
+- **Handlers must be idempotent.** Redis Streams delivery is at-least-once,
+  and redelivery is expected, not a bug. Guard with a conditional write (the
+  `OrderCreated` handler uses `HSETNX`), and put the early return *before*
+  any publish — otherwise one redelivery amplifies into a duplicate
+  downstream event.
+- **Never publish upstream from a handler.** Both sample events share one
+  stream, so a handler that republishes what it consumes is an infinite loop
+  that looks like a busy worker.
+
+## Handler state
+
+Handlers that need state take their own Redis client from
+`messaging/state.py` (`get_state_client()`), never the consumer's — there is
+no request scope here to inherit a connection from, and a handler must not
+issue commands on the connection the read loop depends on. Anything a handler
+writes should carry a TTL (`STATE_TTL_SECONDS`); this template's state keys
+are demo scaffolding, not a durable store.
+
+## Tracing
+
+If you touch the producer or the consumer's message loop, keep the context
+chain intact: the producer injects ambient trace context into
+`EventEnvelope.traceparent`, and the consumer must make its message span
+**current** with `start_as_current_span`, not hold it detached. A detached
+span looks identical in logs and exports, and silently orphans every event a
+handler publishes. `tests/integration/test_tracing.py` asserts on parent span
+ids precisely to catch that.
+
 ## Testing expectations
 
-- New logic in `core/services/`, `messaging/consumer/`, or `db/repositories/`
-  needs a unit test in `tests/unit/`, with Postgres/Redis mocked.
-- A change to the request/response flow, the consumer's failure handling, or
-  a migration needs an integration test in `tests/integration/` (real
-  Postgres and Redis via testcontainers).
-- Don't rely on the unit suite alone to validate a change that touches the
-  database or Redis — see `make test-all` above.
+- New logic in `messaging/`, `health/`, `money.py`, or the worker's lifecycle
+  needs a unit test in `tests/unit/` — these run without Docker.
+- A change to the consumer's failure handling, handler behavior, trace
+  propagation, or the CLI needs an integration test in `tests/integration/`
+  (real Redis via testcontainers).
+- Don't rely on the unit suite alone to validate a change that touches Redis
+  or tracing — see `make test-all` above.
 
 ## Commit messages
 
