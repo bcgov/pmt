@@ -10,7 +10,9 @@ def test_settings_construct_with_no_environment_at_all(monkeypatch):
     able to `python main.py` against a default local Redis.
     """
     for key in list(os.environ):
-        if key.startswith(("DATABASE", "REDIS", "STREAM", "CONSUMER", "HEALTH", "STATE")):
+        if key.startswith(
+            ("DATABASE", "REDIS", "STREAM", "CONSUMER", "HEALTH", "STATE")
+        ):
             monkeypatch.delenv(key, raising=False)
 
     settings = Settings(_env_file=None)

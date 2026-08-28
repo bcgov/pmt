@@ -99,9 +99,7 @@ async def test_failing_handler_retries_then_dead_letters(
     await consumer.close()
 
 
-async def test_malformed_envelope_goes_straight_to_the_dlq(
-    app_settings, redis_client
-):
+async def test_malformed_envelope_goes_straight_to_the_dlq(app_settings, redis_client):
     """A message that cannot parse will never parse; retrying is pointless."""
     consumer = RedisConsumer(consumer_name="test-3")
     await consumer.ensure_group()
