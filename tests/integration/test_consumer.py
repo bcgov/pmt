@@ -14,7 +14,9 @@ pytestmark = pytest.mark.integration
 def make_envelope(order_ref="r1"):
     return EventEnvelope.create(
         event_type="OrderCreated",
-        payload=OrderCreatedEvent(order_ref=order_ref, item="widget", quantity=1),
+        payload=OrderCreatedEvent(
+            order_ref=order_ref, item="widget", quantity=1, unit_price_cents=450
+        ),
         correlation_id="corr-1",
         source="test",
     )
@@ -36,7 +38,7 @@ async def _drain(consumer, timeout=5.0):
 
 
 async def test_valid_message_is_handled_and_acked(
-    app_settings, migrated_db, redis_client, monkeypatch
+    app_settings, redis_client, monkeypatch
 ):
     seen = []
 
@@ -64,7 +66,7 @@ async def test_valid_message_is_handled_and_acked(
 
 
 async def test_failing_handler_retries_then_dead_letters(
-    app_settings, migrated_db, redis_client, monkeypatch
+    app_settings, redis_client, monkeypatch
 ):
     attempts = []
 
@@ -98,7 +100,7 @@ async def test_failing_handler_retries_then_dead_letters(
 
 
 async def test_malformed_envelope_goes_straight_to_the_dlq(
-    app_settings, migrated_db, redis_client
+    app_settings, redis_client
 ):
     """A message that cannot parse will never parse; retrying is pointless."""
     consumer = RedisConsumer(consumer_name="test-3")

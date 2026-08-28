@@ -4,10 +4,11 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field
 
+from messaging.models.events.order_confirmed import OrderConfirmedEvent
 from messaging.models.events.order_created import OrderCreatedEvent
 
 # Add your payload types to this union as the service grows.
-EventPayload = OrderCreatedEvent
+EventPayload = OrderCreatedEvent | OrderConfirmedEvent
 
 SCHEMA_VERSION = "1.0.0"
 
@@ -21,11 +22,17 @@ class EventEnvelope(BaseModel):
     """
 
     event_id: UUID
-    event_type: Literal["OrderCreated"]
+    event_type: Literal["OrderCreated", "OrderConfirmed"]
     timestamp: datetime
     schema_version: str = Field(pattern=r"^\d+\.\d+\.\d+$")
     correlation_id: str
     source: str
+
+    # W3C trace context, injected by the producer from whatever span is
+    # current and extracted by the consumer to parent its message span.
+    # Optional: an envelope published outside a trace simply starts one.
+    traceparent: str | None = None
+
     payload: EventPayload
 
     model_config = {"extra": "forbid"}

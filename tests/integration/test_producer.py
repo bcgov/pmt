@@ -14,7 +14,9 @@ async def test_publish_writes_one_message_with_event_field(app_settings, redis_c
     producer = RedisProducer()
     env = EventEnvelope.create(
         event_type="OrderCreated",
-        payload=OrderCreatedEvent(order_ref="r1", item="widget", quantity=1),
+        payload=OrderCreatedEvent(
+            order_ref="r1", item="widget", quantity=1, unit_price_cents=450
+        ),
         correlation_id="corr-1",
         source="test",
     )
