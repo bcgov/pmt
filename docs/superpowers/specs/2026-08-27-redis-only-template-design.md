@@ -340,11 +340,10 @@ targets are unchanged.
   `HGETALL`, not JSON responses. Gains a short section on the trace chain with
   the span tree from §5. "Make it yours" shrinks from seven files to four:
   `messaging/models/events/`, `messaging/models/envelope.py`,
-  `messaging/consumer/handlers/`, `messaging/consumer/dispatcher.py` — and it
-  notes the minor-units convention, since that is the one payload decision a
-  reader is likely to carry into their own domain — and
+  `messaging/consumer/handlers/`, `messaging/consumer/dispatcher.py` — and
   `OrderConfirmed` now serves as the worked example of that exact four-file
-  edit.
+  edit. It also notes the minor-units convention, since that is the one payload
+  decision a reader is most likely to carry into their own domain.
 - **CLAUDE.md** — Architecture loses layers 1–3 (API, Core, Data Access) and
   gains the worker/CLI entry points; the Migrations section is deleted whole;
   Development Commands loses `migrate` and `revision`. The Consumer section
