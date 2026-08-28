@@ -80,7 +80,8 @@ There is no `/info` endpoint — see §7.
 `argparse`, no new dependency.
 
 ```
-python -m cli publish --ref demo-1 --item widget --quantity 3 [--count N]
+python -m cli publish --ref demo-1 --item widget --quantity 3 \
+                      --unit-price 4.50 [--count N]
 ```
 
 Builds `EventEnvelope.create(event_type="OrderCreated", ..., source="cli")` and
@@ -95,11 +96,17 @@ of the distributed trace rather than an orphan (§5).
 
 Two event types, and the second exists to prove the trace crosses processes.
 
-**`OrderCreated`** (`messaging/models/events/order_created.py`) — unchanged
-payload: `order_ref`, `item`, `quantity`.
+**`OrderCreated`** (`messaging/models/events/order_created.py`) — the existing
+payload plus one field: `order_ref`, `item`, `quantity`, `unit_price`. These are
+the *inputs* to the processing step.
 
-**`OrderConfirmed`** (`messaging/models/events/order_confirmed.py`) — new:
-`order_ref`, `confirmed_at`.
+**`OrderConfirmed`** (`messaging/models/events/order_confirmed.py`) — new, and
+carries the *output*: `order_ref`, `total`, `confirmed_at`.
+
+`unit_price` and `total` are `Decimal`, not `float` — binary floats cannot
+represent money exactly, and a template people copy should not teach otherwise.
+Pydantic serialises `Decimal` to a JSON string, so the value survives the round
+trip through the stream without precision loss; the payload docstring says why.
 
 Both are added to the `Literal` and the `EventPayload` union in
 `messaging/models/envelope.py`, and both get a row in `HANDLERS` in
@@ -118,13 +125,28 @@ first = await r.hsetnx(key, "status", "confirmed")
 if not first:
     log.info("Order already processed; nothing to do")
     return                      # NOTE: returns before publishing
-await r.hset(key, mapping={"item": ..., "quantity": ..., "confirmed_at": ...})
+
+total = payload.quantity * payload.unit_price      # the processing step
+confirmed_at = datetime.now(UTC)
+
+await r.hset(key, mapping={"item": ..., "quantity": ..., "total": str(total),
+                           "confirmed_at": confirmed_at.isoformat()})
 await r.expire(key, settings.STATE_TTL_SECONDS)
 await get_producer().publish(
-    EventEnvelope.create("OrderConfirmed", ..., source="consumer")
+    EventEnvelope.create(
+        "OrderConfirmed",
+        OrderConfirmedEvent(order_ref=..., total=total,
+                            confirmed_at=confirmed_at),
+        source="consumer",
+    )
 )
-log.info("Order confirmed")
+log.info("Order confirmed", total=str(total))
 ```
+
+The multiplication is deliberately trivial, but it is real: the outbound event
+carries a value that did not exist on the inbound one, so the pipeline is
+consume → *compute* → publish rather than consume → relabel → publish. Whatever
+replaces this handler slots into the same three positions.
 
 The early return on redelivery is the load-bearing detail: a duplicate
 `OrderCreated` must not emit a duplicate `OrderConfirmed`. Idempotency here is
@@ -142,7 +164,7 @@ a Lua script or `SET NX` as the atomic alternative.
 
 #### `OrderConfirmed` handler
 
-Logs the confirmation and stops. Deliberately side-effect-free: it is the
+Logs the confirmed order and its total, and stops. Deliberately side-effect-free: it is the
 terminal hop, and its docstring points at the `OrderCreated` handler for the
 idempotency pattern rather than duplicating the `HSETNX` machinery. It must
 never publish `OrderCreated` — the docstring says so, because a cycle on a
@@ -222,13 +244,14 @@ the `FastAPIInstrumentor` import along with it.
 
 ```
 $ make demo
-  python -m cli publish --ref demo-1 --count 2
+  python -m cli publish --ref demo-1 --quantity 3 --unit-price 4.50 --count 2
     └→ XADD order.events OrderCreated  (traceparent injected)   x2
 
 [worker] XREADGROUP → OrderCreated (1st copy)
   └→ span parented to cli.publish, made current
-  └→ HSETNX order:demo-1 status confirmed  → 1 → "Order confirmed"
-  └→ XADD order.events OrderConfirmed  (traceparent = this span)
+  └→ HSETNX order:demo-1 status confirmed  → 1
+  └→ total = 3 * 4.50 = 13.50 → stored on the hash → "Order confirmed"
+  └→ XADD order.events OrderConfirmed {total: "13.50"}  (traceparent = this span)
   └→ XACK
 
 [worker] XREADGROUP → OrderCreated (2nd copy)
@@ -240,6 +263,7 @@ $ make demo
   └→ log; XACK
 
 $ redis-cli HGETALL order:demo-1
+  status confirmed  item widget  quantity 3  total 13.50  confirmed_at ...
 ```
 
 Note the asymmetry the demo makes visible: two `OrderCreated` in, one
@@ -280,8 +304,11 @@ remain.
 - Deleted: `test_migrations.py`, `test_order_repository.py`,
   `test_order_routes.py`, `test_order_service.py`.
 - Rewritten: `test_health.py` (health server against reachable and unreachable
-  Redis), `test_order_created_handler.py` (fresh key confirms and publishes
-  `OrderConfirmed`; **replay is a no-op that publishes nothing**),
+  Redis), `test_order_created_handler.py` (fresh key confirms, computes the
+  total, stores it and publishes `OrderConfirmed` carrying it; **replay is a
+  no-op that publishes nothing**; a `Decimal` case asserts the total survives
+  the JSON round trip exactly — e.g. `0.1 + 0.2` arithmetic that `float` would
+  corrupt),
   `test_order_roundtrip.py` (CLI publish → both hops → key state),
   `test_main.py` (worker starts both tasks; signal triggers graceful shutdown).
 - New: `test_order_confirmed_handler.py`; `test_tracing.py` — with an
