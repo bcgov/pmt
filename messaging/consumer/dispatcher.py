@@ -1,6 +1,7 @@
 from collections.abc import Awaitable, Callable
 
 from config.logging import get_logger
+from messaging.consumer.handlers.order_confirmed import handle as handle_order_confirmed
 from messaging.consumer.handlers.order_created import handle as handle_order_created
 from messaging.models import EventEnvelope, EventPayload
 
@@ -11,6 +12,7 @@ Handler = Callable[..., Awaitable[None]]
 # Event routing table. Register new event types here.
 HANDLERS: dict[str, Handler] = {
     "OrderCreated": handle_order_created,
+    "OrderConfirmed": handle_order_confirmed,
 }
 
 

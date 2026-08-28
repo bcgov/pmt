@@ -7,7 +7,9 @@ from messaging.models import EventEnvelope, OrderCreatedEvent
 def make_envelope(event_type="OrderCreated"):
     return EventEnvelope.create(
         event_type=event_type,
-        payload=OrderCreatedEvent(order_ref="r1", item="widget", quantity=1),
+        payload=OrderCreatedEvent(
+            order_ref="r1", item="widget", quantity=1, unit_price_cents=450
+        ),
         correlation_id="corr-1",
         source="test",
     )
