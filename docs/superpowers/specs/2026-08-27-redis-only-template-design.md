@@ -11,16 +11,17 @@ consumer. The HTTP API and PostgreSQL layers are removed entirely. What
 remains is a worker process that consumes events, a CLI that publishes them,
 and the envelope/dispatcher/handler machinery between them.
 
-The template's teaching value must survive the strip. Specifically: at-least-once
-delivery, idempotent handlers, retry, dead-lettering, `XAUTOCLAIM` recovery,
-and a validated envelope as the single schema boundary.
+The template's teaching value must survive the strip. Specifically:
+at-least-once delivery, idempotent handlers, retry, dead-lettering,
+`XAUTOCLAIM` recovery, a validated envelope as the single schema boundary, and
+an unbroken distributed trace across every process hop.
 
 ## Non-goals
 
 - No HTTP API, no request/response layer, no OpenAPI docs.
 - No relational database, no ORM, no migrations.
-- No new domain. The `OrderCreated` sample event is retained as-is; only its
-  handler's storage changes.
+- No new domain. The `OrderCreated` sample event is retained; a second event,
+  `OrderConfirmed`, is added solely to make the consumer-as-producer hop real.
 
 ## Architecture
 
@@ -55,18 +56,24 @@ Replaces the FastAPI app. Responsibilities:
   timeout before cancelling, `consumer.close()`, `close_producer()`.
 - No `close_db()` — `db/` is gone.
 
+The worker holds the process-wide producer as well as the consumer, because
+handlers publish (see §5).
+
 ### 2. Health server (`health/server.py`)
 
 `asyncio.start_server` on `settings.HEALTH_PORT`. Reads the request line,
 ignores everything else, and responds:
 
 - `GET /health` → Redis `PING` with a 2-second timeout. `200` with
-  `{"status":"ok","redis":"ok"}`, or `503` with `{"status":"degraded","redis":"down"}`.
+  `{"status":"ok","redis":"ok"}`, or `503` with
+  `{"status":"degraded","redis":"down"}`.
 - Any other path → `404`.
 
 Connection: `Connection: close` on every response; no keep-alive handling. This
 is a probe endpoint, not a web framework, and the code should say so in a
 docstring.
+
+There is no `/info` endpoint — see §7.
 
 ### 3. CLI (`cli.py`)
 
@@ -81,44 +88,101 @@ publishes each one, printing the returned stream message id. `--count` repeats
 the same ref, which is what makes the idempotency demo visible. Closes the
 producer before exiting.
 
-### 4. Handler (`messaging/consumer/handlers/order_created.py`)
+Each publish is wrapped in a `cli.publish` span, so the CLI process is the root
+of the distributed trace rather than an orphan (§5).
+
+### 4. Events and handlers
+
+Two event types, and the second exists to prove the trace crosses processes.
+
+**`OrderCreated`** (`messaging/models/events/order_created.py`) — unchanged
+payload: `order_ref`, `item`, `quantity`.
+
+**`OrderConfirmed`** (`messaging/models/events/order_confirmed.py`) — new:
+`order_ref`, `confirmed_at`.
+
+Both are added to the `Literal` and the `EventPayload` union in
+`messaging/models/envelope.py`, and both get a row in `HANDLERS` in
+`messaging/consumer/dispatcher.py`. The `EventPayload` union stops being a bare
+alias and becomes a real union, which is the shape the README's extension
+instructions describe.
+
+#### `OrderCreated` handler
 
 Replaces the SQL `UPDATE ... WHERE status='pending'` with a conditional Redis
-write that preserves the same semantics.
+write that preserves the same semantics, then publishes the follow-on event.
 
 ```python
 key = f"order:{payload.order_ref}"
 first = await r.hsetnx(key, "status", "confirmed")
 if not first:
     log.info("Order already processed; nothing to do")
-    return
+    return                      # NOTE: returns before publishing
 await r.hset(key, mapping={"item": ..., "quantity": ..., "confirmed_at": ...})
 await r.expire(key, settings.STATE_TTL_SECONDS)
+await get_producer().publish(
+    EventEnvelope.create("OrderConfirmed", ..., source="consumer")
+)
 log.info("Order confirmed")
 ```
 
-The handler owns its own Redis client, distinct from the consumer's — this
-mirrors, and the docstring should carry over, the current lesson that a handler
-has no ambient request context and must acquire its own resources.
+The early return on redelivery is the load-bearing detail: a duplicate
+`OrderCreated` must not emit a duplicate `OrderConfirmed`. Idempotency here is
+not only about local state, it is about not amplifying redeliveries downstream.
+This must be asserted by a test, not just commented.
+
+The handler owns its own Redis client for state, distinct from the consumer's —
+this mirrors, and the docstring should carry over, the current lesson that a
+handler has no ambient request context and must acquire its own resources.
 
 Known non-atomicity, to be documented in the docstring rather than engineered
 around: `HSETNX` followed by `EXPIRE` is two round trips, so a crash between
 them leaves a key with no TTL. Acceptable for a demo store; the comment names
 a Lua script or `SET NX` as the atomic alternative.
 
-### 5. Tracing (`config/tracing.py`, envelope, producer, consumer)
+#### `OrderConfirmed` handler
 
-FastAPI auto-instrumentation is removed, so trace continuity becomes explicit:
+Logs the confirmation and stops. Deliberately side-effect-free: it is the
+terminal hop, and its docstring points at the `OrderCreated` handler for the
+idempotency pattern rather than duplicating the `HSETNX` machinery. It must
+never publish `OrderCreated` — the docstring says so, because a cycle on a
+single stream is the obvious way for someone extending this template to hang
+their worker.
+
+### 5. Tracing — end-to-end, in both directions
+
+FastAPI auto-instrumentation is removed, so trace continuity becomes explicit
+and becomes a first-class feature of the template rather than a leftover.
 
 - `EventEnvelope` gains `traceparent: str | None = None`.
-- `RedisProducer.publish` injects the current context via the OTel W3C
-  propagator into that field.
-- `RedisConsumer` extracts it and opens the per-message span as a child of the
-  publishing span.
+- `RedisProducer.publish` injects the **current** context via the OTel W3C
+  propagator into that field. It reads ambient context; it never takes a span
+  argument. This is what makes the same producer work unchanged whether it is
+  called from the CLI or from inside a handler.
+- `RedisConsumer` extracts `traceparent` and opens the per-message span with
+  that as its parent.
+- **The per-message span MUST be the active context for the duration of
+  dispatch** — `with tracer.start_as_current_span(...)`, not a detached span.
+  A detached span still logs and still exports; it just silently orphans
+  everything the handler publishes. Because the producer reads ambient context,
+  this one line is the entire mechanism by which the consumer forwards the
+  trace to the next hop.
 
-`extra="forbid"` on the envelope means an event published before this field
-existed still validates (the field is optional, not required), but an envelope
-carrying an unknown field does not — unchanged behaviour.
+Resulting trace for `make demo`, one trace with two process hops:
+
+```
+[cli.publish]                                  (cli process, root)
+  └── [consume OrderCreated]                   (worker) parent = cli.publish
+        └── [publish OrderConfirmed]           (worker) parent = consume
+              └── [consume OrderConfirmed]     (worker) parent = publish
+```
+
+`extra="forbid"` on the envelope is unchanged, and `traceparent` is optional,
+so an envelope published without it still validates and simply starts a new
+trace.
+
+This is no longer optional scope. The chain in §4 exists to demonstrate it, and
+a test asserts the parenting rather than merely asserting spans exist.
 
 ### 6. Settings (`config/settings.py`)
 
@@ -129,34 +193,57 @@ carrying an unknown field does not — unchanged behaviour.
   logging, and OTEL settings.
 - `SERVICE_PORT` is removed in favour of `HEALTH_PORT`, which names what it
   actually binds.
+- `SERVICE_NAME`, `SERVICE_VERSION` and `ENVIRONMENT` are retained. Their only
+  remaining consumer is the OTel `Resource` (§7).
+
+### 7. `/info` is removed, not ported
+
+`api/routes/info.py` returned `SERVICE_NAME`, `SERVICE_VERSION` and
+`ENVIRONMENT`. `config/tracing.py` already stamps exactly those three values on
+every span as `service.name`, `service.version` and `deployment.environment`.
+The endpoint duplicated a resource attribute set the service ships anyway, so
+it is deleted and the spec records where the data now lives: on every exported
+span, queryable in the collector, without an HTTP round trip.
 
 ## Deletions
 
 Trees: `api/`, `core/`, `db/`.
 Files: `alembic.ini`, `docker-entrypoint.sh`, `config/request_logger.py`.
 Dependencies: `fastapi`, `uvicorn`, `sqlalchemy`, `asyncpg`, `alembic`,
-`testcontainers` Postgres extra.
+`opentelemetry-instrumentation-fastapi`, `testcontainers` Postgres extra.
 Compose: the `db` service, the `pmt_pgdata` volume, `DATABASE_URL`.
 Makefile: `migrate`, `revision`; `up`/`demo` rewritten.
 Dockerfile: entrypoint becomes `CMD ["python", "main.py"]`.
+
+`config/tracing.py` keeps `init_tracing()` but drops its `app` parameter and
+the `FastAPIInstrumentor` import along with it.
 
 ## Data flow
 
 ```
 $ make demo
   python -m cli publish --ref demo-1 --count 2
-    └→ XADD order.events {"event": "<envelope json>"}   x2
+    └→ XADD order.events OrderCreated  (traceparent injected)   x2
 
-[worker] XREADGROUP
-  └→ envelope validated → dispatch → handler
-       HSETNX order:demo-1 status confirmed  → 1 → "Order confirmed"
+[worker] XREADGROUP → OrderCreated (1st copy)
+  └→ span parented to cli.publish, made current
+  └→ HSETNX order:demo-1 status confirmed  → 1 → "Order confirmed"
+  └→ XADD order.events OrderConfirmed  (traceparent = this span)
   └→ XACK
-[worker] XREADGROUP  (the second copy)
-  └→ HSETNX order:demo-1 status confirmed  → 0 → "Order already processed"
+
+[worker] XREADGROUP → OrderCreated (2nd copy)
+  └→ HSETNX → 0 → "Order already processed"; NO OrderConfirmed published
   └→ XACK
+
+[worker] XREADGROUP → OrderConfirmed
+  └→ span parented to the handler's publish span
+  └→ log; XACK
 
 $ redis-cli HGETALL order:demo-1
 ```
+
+Note the asymmetry the demo makes visible: two `OrderCreated` in, one
+`OrderConfirmed` out.
 
 ## Error handling
 
@@ -173,6 +260,16 @@ machinery is the point of the template:
   to be inconsistent with any more, so the "committed but unpublished" caveat
   that `OrderService` documented disappears along with the service.
 
+New case: if the `OrderCreated` handler's `HSETNX` succeeds but the
+`OrderConfirmed` publish fails, the handler raises and the message is retried.
+The retry finds `HSETNX` returning 0 and takes the early-return path, so the
+`OrderConfirmed` event is never published. The state is correct and the
+downstream event is lost. This is the same non-atomic write-then-publish
+problem `OrderService` documented, in a new place; the docstring names it and
+points at the transactional-outbox pattern, and the README keeps that
+discussion. It is documented, not solved — solving it is out of scope for a
+template.
+
 ## Testing
 
 `tests/conftest.py` loses the Postgres container, `migrated_db`,
@@ -183,12 +280,17 @@ remain.
 - Deleted: `test_migrations.py`, `test_order_repository.py`,
   `test_order_routes.py`, `test_order_service.py`.
 - Rewritten: `test_health.py` (health server against reachable and unreachable
-  Redis), `test_order_created_handler.py` (fresh key confirms; replay is a
-  no-op and leaves the hash unchanged), `test_order_roundtrip.py` (CLI publish
-  → consumer → key state), `test_main.py` (worker starts both tasks; signal
-  triggers graceful shutdown).
-- Unchanged: `test_dispatcher.py`, `test_envelope.py`, `test_redis_consumer.py`,
-  `test_producer.py`. `test_envelope.py` gains a case for `traceparent`.
+  Redis), `test_order_created_handler.py` (fresh key confirms and publishes
+  `OrderConfirmed`; **replay is a no-op that publishes nothing**),
+  `test_order_roundtrip.py` (CLI publish → both hops → key state),
+  `test_main.py` (worker starts both tasks; signal triggers graceful shutdown).
+- New: `test_order_confirmed_handler.py`; `test_tracing.py` — with an
+  in-memory span exporter, assert the full parent chain of §5, including that a
+  publish issued from inside a handler is a child of that handler's message
+  span. This is the test that would catch a detached-span regression.
+- Updated: `test_envelope.py` (both event types, `traceparent` optional),
+  `test_dispatcher.py` (two registered handlers).
+- Unchanged: `test_redis_consumer.py`, `test_producer.py`.
 
 The unit/integration marker split and the `make test` / `make test-all`
 targets are unchanged.
@@ -197,20 +299,29 @@ targets are unchanged.
 
 - **README.md** — rewritten around the worker and CLI. The quickstart becomes
   `make up` / `make demo`; the expected output is worker log lines and a
-  `HGETALL`, not JSON responses. "Make it yours" shrinks from seven files to
-  four: `messaging/models/events/order_created.py`, `messaging/models/envelope.py`,
-  `messaging/consumer/handlers/`, `messaging/consumer/dispatcher.py`.
+  `HGETALL`, not JSON responses. Gains a short section on the trace chain with
+  the span tree from §5. "Make it yours" shrinks from seven files to four:
+  `messaging/models/events/`, `messaging/models/envelope.py`,
+  `messaging/consumer/handlers/`, `messaging/consumer/dispatcher.py` — and
+  `OrderConfirmed` now serves as the worked example of that exact four-file
+  edit.
 - **CLAUDE.md** — Architecture loses layers 1–3 (API, Core, Data Access) and
   gains the worker/CLI entry points; the Migrations section is deleted whole;
   Development Commands loses `migrate` and `revision`. The Consumer section
   survives nearly intact, with the idempotency example restated in terms of
-  `HSETNX`.
+  `HSETNX` and extended with the "do not amplify redeliveries" rule. The
+  Observability section gains the active-context requirement.
 - **.env.example** — `DATABASE_URL` removed, `HEALTH_PORT` and
   `STATE_TTL_SECONDS` added.
 
-## Open risk
+## Risks
 
-The tracing work (§5) is the only genuinely new engineering rather than a port
-or a deletion. If it proves fiddly, the agreed fallback is spans without
-propagation: the consumer opens a span per message and the `traceparent` field
-is not added.
+- **Cycle risk.** Two event types on one stream with a handler that publishes
+  makes an event cycle possible for anyone extending the template. Mitigated by
+  docstring and README warnings, not by code.
+- **Trace assertions are the fragile part of the test suite.** The span-parenting
+  test depends on OTel's in-memory exporter and context propagation behaving
+  under `pytest-asyncio`'s per-test event loops. If it proves flaky, the
+  fallback is to assert on the `traceparent` field carried in the published
+  envelope — weaker, but stable, and it still catches a detached-span regression
+  because a detached span yields a different span id.
