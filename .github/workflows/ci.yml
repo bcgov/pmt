@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches:
+      - main
+      - redis-only-template
+  workflow_dispatch:
+
+# A second push to the same branch cancels the run the first one started.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint-and-unit:
+    name: Lint and unit tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # Before setup-python, so its cache backend can find poetry on PATH.
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: poetry
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      - name: Lint
+        run: make lint
+
+      # The CI-shaped half of `make fmt`: report, never rewrite.
+      - name: Check formatting
+        run: poetry run black --check .
+
+      - name: Unit tests
+        run: make test
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-unit
+          path: reports/
+          if-no-files-found: ignore
+
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Poetry
+        run: pipx install poetry
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: poetry
+
+      - name: Install dependencies
+        run: poetry install --no-interaction
+
+      # Docker already runs on the hosted runner, so testcontainers needs
+      # no service container and no extra configuration.
+      - name: Integration tests
+        run: make test-all
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reports-integration
+          path: reports/
+          if-no-files-found: ignore
