@@ -12,12 +12,21 @@ class Settings(BaseSettings):
     ENVIRONMENT: str = "development"  # development | staging | production
     SERVICE_NAME: str = "python-microservice-template"
     SERVICE_VERSION: str = "0.1.0"
-    SERVICE_PORT: int = 8000
+
+    # SERVICE_NAME / SERVICE_VERSION / ENVIRONMENT have exactly one consumer
+    # now: the OpenTelemetry Resource in config/tracing.py, which stamps them
+    # on every exported span. The /info endpoint that used to serve them is
+    # gone — the collector has the same three values.
 
     # -------------------------
-    # Database Configuration
+    # Health probe server
     # -------------------------
-    DATABASE_URL: str
+    HEALTH_PORT: int = 8000
+
+    # -------------------------
+    # Handler state store
+    # -------------------------
+    STATE_TTL_SECONDS: int = 3600
 
     # -------------------------
     # Redis Streams Messaging
