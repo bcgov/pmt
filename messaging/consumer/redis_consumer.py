@@ -5,6 +5,8 @@ import traceback
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from opentelemetry import trace
+from opentelemetry.propagate import extract
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, ResponseError
@@ -15,6 +17,7 @@ from messaging.consumer.dispatcher import dispatch_event
 from messaging.models import EventEnvelope
 
 logger = get_logger(__name__)
+tracer = trace.get_tracer(__name__)
 
 
 class RedisConsumer:
@@ -139,35 +142,49 @@ class RedisConsumer:
             await self._dead_letter(message_id, fields, "validation_error", str(e))
             return
 
-        log = logger.bind(
-            message_id=message_id,
-            event_id=str(envelope.event_id),
-            event_type=envelope.event_type,
-            correlation_id=envelope.correlation_id,
-        )
+        carrier = {"traceparent": envelope.traceparent} if envelope.traceparent else {}
+        parent_context = extract(carrier)
 
-        last_error = ""
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                await dispatch_event(envelope)
-                await self.redis.xack(self.stream_name, self.consumer_group, message_id)
-                log.debug("Message handled and acked", attempt=attempt)
-                return
-            except Exception as e:
-                last_error = f"{e}\n{traceback.format_exc()}"
-                log.warning(
-                    "Handler failed",
-                    attempt=attempt,
-                    max_retries=self.max_retries,
-                    error=str(e),
-                )
-                if attempt < self.max_retries:
-                    backoff = self.retry_backoff_ms * (2 ** (attempt - 1)) / 1000
-                    await asyncio.sleep(backoff)
+        # start_as_current_span, NOT a detached span. The producer reads
+        # ambient context, so making this span current is the entire mechanism
+        # by which an event published from inside a handler continues this
+        # trace. A detached span logs and exports identically and silently
+        # orphans every downstream hop — which is why test_tracing.py asserts
+        # on parent span ids rather than on spans merely existing.
+        with tracer.start_as_current_span(
+            f"consume {envelope.event_type}", context=parent_context
+        ):
+            log = logger.bind(
+                message_id=message_id,
+                event_id=str(envelope.event_id),
+                event_type=envelope.event_type,
+                correlation_id=envelope.correlation_id,
+            )
 
-        await self._dead_letter(
-            message_id, fields, "handler_error", last_error, self.max_retries
-        )
+            last_error = ""
+            for attempt in range(1, self.max_retries + 1):
+                try:
+                    await dispatch_event(envelope)
+                    await self.redis.xack(
+                        self.stream_name, self.consumer_group, message_id
+                    )
+                    log.debug("Message handled and acked", attempt=attempt)
+                    return
+                except Exception as e:
+                    last_error = f"{e}\n{traceback.format_exc()}"
+                    log.warning(
+                        "Handler failed",
+                        attempt=attempt,
+                        max_retries=self.max_retries,
+                        error=str(e),
+                    )
+                    if attempt < self.max_retries:
+                        backoff = self.retry_backoff_ms * (2 ** (attempt - 1)) / 1000
+                        await asyncio.sleep(backoff)
+
+            await self._dead_letter(
+                message_id, fields, "handler_error", last_error, self.max_retries
+            )
 
     # ------------------------------------------------------------------
     # Crash recovery

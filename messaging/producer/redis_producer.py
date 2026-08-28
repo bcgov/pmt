@@ -1,3 +1,5 @@
+from opentelemetry import trace
+from opentelemetry.propagate import inject
 from redis.asyncio import Redis
 
 from config.logging import get_logger
@@ -5,6 +7,7 @@ from config.settings import get_settings
 from messaging.models import EventEnvelope
 
 logger = get_logger(__name__)
+tracer = trace.get_tracer(__name__)
 
 
 class RedisProducer:
@@ -23,28 +26,41 @@ class RedisProducer:
         """
         Publish one envelope. Message shape is {"event": "<json>"} — the
         consumer reads the same key.
+
+        Trace context is read from whatever span is CURRENT, not passed in.
+        That is deliberate: the same producer is called from the CLI (where the
+        current span is the CLI's root) and from inside a handler (where it is
+        the span for the message being handled), and both cases chain correctly
+        with no argument threading.
         """
-        try:
-            message_id = await self.redis.xadd(
-                name=self.stream_name,
-                fields={"event": envelope.model_dump_json()},
+        with tracer.start_as_current_span(f"publish {envelope.event_type}"):
+            carrier: dict[str, str] = {}
+            inject(carrier)
+            envelope = envelope.model_copy(
+                update={"traceparent": carrier.get("traceparent")}
             )
-            logger.info(
-                "Event published",
-                event_id=str(envelope.event_id),
-                event_type=envelope.event_type,
-                stream=self.stream_name,
-                message_id=message_id,
-            )
-            return message_id
-        except Exception as e:
-            logger.error(
-                "Failed to publish event",
-                event_type=envelope.event_type,
-                error=str(e),
-                exc_info=True,
-            )
-            raise
+
+            try:
+                message_id = await self.redis.xadd(
+                    name=self.stream_name,
+                    fields={"event": envelope.model_dump_json()},
+                )
+                logger.info(
+                    "Event published",
+                    event_id=str(envelope.event_id),
+                    event_type=envelope.event_type,
+                    stream=self.stream_name,
+                    message_id=message_id,
+                )
+                return message_id
+            except Exception as e:
+                logger.error(
+                    "Failed to publish event",
+                    event_type=envelope.event_type,
+                    error=str(e),
+                    exc_info=True,
+                )
+                raise
 
     async def close(self) -> None:
         await self.redis.aclose()
