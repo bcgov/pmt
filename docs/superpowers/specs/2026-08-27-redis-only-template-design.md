@@ -81,7 +81,7 @@ There is no `/info` endpoint — see §7.
 
 ```
 python -m cli publish --ref demo-1 --item widget --quantity 3 \
-                      --unit-price 4.50 [--count N]
+                      --unit-price-cents 450 [--count N]
 ```
 
 Builds `EventEnvelope.create(event_type="OrderCreated", ..., source="cli")` and
@@ -97,16 +97,24 @@ of the distributed trace rather than an orphan (§5).
 Two event types, and the second exists to prove the trace crosses processes.
 
 **`OrderCreated`** (`messaging/models/events/order_created.py`) — the existing
-payload plus one field: `order_ref`, `item`, `quantity`, `unit_price`. These are
-the *inputs* to the processing step.
+payload plus one field: `order_ref`, `item`, `quantity`, `unit_price_cents`.
+These are the *inputs* to the processing step.
 
 **`OrderConfirmed`** (`messaging/models/events/order_confirmed.py`) — new, and
-carries the *output*: `order_ref`, `total`, `confirmed_at`.
+carries the *output*: `order_ref`, `total_cents`, `confirmed_at`.
 
-`unit_price` and `total` are `Decimal`, not `float` — binary floats cannot
-represent money exactly, and a template people copy should not teach otherwise.
-Pydantic serialises `Decimal` to a JSON string, so the value survives the round
-trip through the stream without precision loss; the payload docstring says why.
+**Money is integer minor units throughout.** `unit_price_cents` and
+`total_cents` are `int`, and `1000` means `10.00`. Never `float` — binary
+floats cannot represent money exactly, and a template people copy should not
+teach otherwise. Integers also serialise to JSON as themselves, so no
+precision question arises anywhere on the wire, in Redis, or in a consumer
+written in another language.
+
+The `_cents` suffix is part of the lesson: the unit lives in the field name, so
+no reader has to guess the scale of a bare `price`. Formatting for humans
+(`1350 → "13.50"`) happens only at the edges — a `format_cents()` helper used
+by the CLI's output and the handler's log line, never in the payload models
+themselves.
 
 Both are added to the `Literal` and the `EventPayload` union in
 `messaging/models/envelope.py`, and both get a row in `HANDLERS` in
@@ -126,21 +134,23 @@ if not first:
     log.info("Order already processed; nothing to do")
     return                      # NOTE: returns before publishing
 
-total = payload.quantity * payload.unit_price      # the processing step
+# the processing step — int arithmetic, exact by construction
+total_cents = payload.quantity * payload.unit_price_cents
 confirmed_at = datetime.now(UTC)
 
-await r.hset(key, mapping={"item": ..., "quantity": ..., "total": str(total),
+await r.hset(key, mapping={"item": ..., "quantity": ...,
+                           "total_cents": total_cents,
                            "confirmed_at": confirmed_at.isoformat()})
 await r.expire(key, settings.STATE_TTL_SECONDS)
 await get_producer().publish(
     EventEnvelope.create(
         "OrderConfirmed",
-        OrderConfirmedEvent(order_ref=..., total=total,
+        OrderConfirmedEvent(order_ref=..., total_cents=total_cents,
                             confirmed_at=confirmed_at),
         source="consumer",
     )
 )
-log.info("Order confirmed", total=str(total))
+log.info("Order confirmed", total=format_cents(total_cents))
 ```
 
 The multiplication is deliberately trivial, but it is real: the outbound event
@@ -164,7 +174,7 @@ a Lua script or `SET NX` as the atomic alternative.
 
 #### `OrderConfirmed` handler
 
-Logs the confirmed order and its total, and stops. Deliberately side-effect-free: it is the
+Logs the confirmed order and its total (formatted for humans), and stops. Deliberately side-effect-free: it is the
 terminal hop, and its docstring points at the `OrderCreated` handler for the
 idempotency pattern rather than duplicating the `HSETNX` machinery. It must
 never publish `OrderCreated` — the docstring says so, because a cycle on a
@@ -244,14 +254,14 @@ the `FastAPIInstrumentor` import along with it.
 
 ```
 $ make demo
-  python -m cli publish --ref demo-1 --quantity 3 --unit-price 4.50 --count 2
+  python -m cli publish --ref demo-1 --quantity 3 --unit-price-cents 450 --count 2
     └→ XADD order.events OrderCreated  (traceparent injected)   x2
 
 [worker] XREADGROUP → OrderCreated (1st copy)
   └→ span parented to cli.publish, made current
   └→ HSETNX order:demo-1 status confirmed  → 1
-  └→ total = 3 * 4.50 = 13.50 → stored on the hash → "Order confirmed"
-  └→ XADD order.events OrderConfirmed {total: "13.50"}  (traceparent = this span)
+  └→ total_cents = 3 * 450 = 1350 → stored on the hash → "Order confirmed"
+  └→ XADD order.events OrderConfirmed {total_cents: 1350}  (traceparent = span)
   └→ XACK
 
 [worker] XREADGROUP → OrderCreated (2nd copy)
@@ -263,7 +273,7 @@ $ make demo
   └→ log; XACK
 
 $ redis-cli HGETALL order:demo-1
-  status confirmed  item widget  quantity 3  total 13.50  confirmed_at ...
+  status confirmed  item widget  quantity 3  total_cents 1350  confirmed_at ...
 ```
 
 Note the asymmetry the demo makes visible: two `OrderCreated` in, one
@@ -304,11 +314,12 @@ remain.
 - Deleted: `test_migrations.py`, `test_order_repository.py`,
   `test_order_routes.py`, `test_order_service.py`.
 - Rewritten: `test_health.py` (health server against reachable and unreachable
-  Redis), `test_order_created_handler.py` (fresh key confirms, computes the
-  total, stores it and publishes `OrderConfirmed` carrying it; **replay is a
-  no-op that publishes nothing**; a `Decimal` case asserts the total survives
-  the JSON round trip exactly — e.g. `0.1 + 0.2` arithmetic that `float` would
-  corrupt),
+  Redis), `test_order_created_handler.py` (fresh key confirms, computes
+  `total_cents`, stores it and publishes `OrderConfirmed` carrying it;
+  **replay is a no-op that publishes nothing**; a case asserts the total is an
+  exact `int` after the JSON round trip, and that a non-integer
+  `unit_price_cents` is rejected by envelope validation rather than silently
+  coerced),
   `test_order_roundtrip.py` (CLI publish → both hops → key state),
   `test_main.py` (worker starts both tasks; signal triggers graceful shutdown).
 - New: `test_order_confirmed_handler.py`; `test_tracing.py` — with an
@@ -329,7 +340,9 @@ targets are unchanged.
   `HGETALL`, not JSON responses. Gains a short section on the trace chain with
   the span tree from §5. "Make it yours" shrinks from seven files to four:
   `messaging/models/events/`, `messaging/models/envelope.py`,
-  `messaging/consumer/handlers/`, `messaging/consumer/dispatcher.py` — and
+  `messaging/consumer/handlers/`, `messaging/consumer/dispatcher.py` — and it
+  notes the minor-units convention, since that is the one payload decision a
+  reader is likely to carry into their own domain — and
   `OrderConfirmed` now serves as the worked example of that exact four-file
   edit.
 - **CLAUDE.md** — Architecture loses layers 1–3 (API, Core, Data Access) and
