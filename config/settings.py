@@ -37,6 +37,19 @@ class Settings(BaseSettings):
     DLQ_STREAM_NAME: str = ""  # empty -> derived from STREAM_NAME
 
     # -------------------------
+    # Outbox relay
+    # -------------------------
+    RELAY_ENABLED: bool = True
+    OUTBOX_POLL_INTERVAL_MS: int = 200
+    # Also caps duplicate amplification: a crash mid-batch republishes at most
+    # this many rows.
+    OUTBOX_BATCH_SIZE: int = 20
+    OUTBOX_RETRY_BACKOFF_MS: int = 500
+    OUTBOX_MAX_BACKOFF_MS: int = 30_000
+    OUTBOX_RETENTION_HOURS: int = 24
+    OUTBOX_SWEEP_INTERVAL_S: int = 300
+
+    # -------------------------
     # Logging
     # -------------------------
     LOG_LEVEL: str = "INFO"
