@@ -11,6 +11,10 @@ async def noop():
     pass
 
 
+async def _noop(*args, **kwargs):
+    return None
+
+
 class FakeConsumer:
     """
     Mirrors RedisConsumer's lifecycle without touching Redis.
@@ -141,3 +145,83 @@ async def test_lifespan_logs_and_continues_when_the_consumer_task_errors(monkeyp
         await asyncio.sleep(0)  # let the consumer task run and raise
 
     assert consumer.closed is True
+
+
+async def test_lifespan_starts_and_stops_the_relay(monkeypatch):
+    import main
+
+    stopped = []
+    fake_relay = None
+
+    class FakeRelay:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self._run_forever = asyncio.Event()
+
+        async def start(self):
+            self.started.set()
+            await self._run_forever.wait()
+
+        async def stop(self):
+            stopped.append(True)
+            self._run_forever.set()
+
+    class FakeConsumer:
+        async def start(self):
+            await asyncio.Event().wait()
+
+        async def stop(self):
+            pass
+
+        async def close(self):
+            pass
+
+    fake_relay = FakeRelay()
+    monkeypatch.setattr(main, "RedisConsumer", lambda: FakeConsumer())
+    monkeypatch.setattr(main, "get_relay", lambda: fake_relay)
+    monkeypatch.setattr(main, "close_producer", _noop)
+    monkeypatch.setattr(main, "close_relay", _noop)
+    monkeypatch.setattr(main, "close_db", _noop)
+
+    async with main.lifespan(main.app):
+        await fake_relay.started.wait()
+
+    assert stopped == [True]
+
+
+async def test_relay_is_not_started_when_disabled(monkeypatch):
+    """RELAY_ENABLED=false lets the relay run in another deployment instead."""
+    import main
+    from config.settings import get_settings
+
+    started = []
+
+    class FakeRelay:
+        async def start(self):
+            started.append(True)
+
+        async def stop(self):
+            pass
+
+    class FakeConsumer:
+        async def start(self):
+            await asyncio.Event().wait()
+
+        async def stop(self):
+            pass
+
+        async def close(self):
+            pass
+
+    settings = get_settings()
+    monkeypatch.setattr(settings, "RELAY_ENABLED", False)
+    monkeypatch.setattr(main, "RedisConsumer", lambda: FakeConsumer())
+    monkeypatch.setattr(main, "get_relay", lambda: FakeRelay())
+    monkeypatch.setattr(main, "close_producer", _noop)
+    monkeypatch.setattr(main, "close_relay", _noop)
+    monkeypatch.setattr(main, "close_db", _noop)
+
+    async with main.lifespan(main.app):
+        pass
+
+    assert started == []

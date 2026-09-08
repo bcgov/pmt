@@ -8,9 +8,11 @@ from fastapi import FastAPI
 from api.routes import health, info, orders
 from config.logging import configure_logging, get_logger
 from config.request_logger import RequestLoggingMiddleware
+from config.settings import get_settings
 from config.tracing import init_tracing
 from db.postgres.session import close_db
 from messaging.consumer import RedisConsumer
+from messaging.outbox import close_relay, get_relay
 from messaging.producer.redis_producer import close_producer
 
 configure_logging()
@@ -20,6 +22,8 @@ logger = get_logger(__name__)
 # Global consumer instance
 consumer = None
 consumer_task = None
+relay = None
+relay_task = None
 
 
 @asynccontextmanager
@@ -30,7 +34,7 @@ async def lifespan(app: FastAPI):
     The schema is NOT created here — run `alembic upgrade head` (the compose
     entrypoint and `make migrate` both do).
     """
-    global consumer, consumer_task
+    global consumer, consumer_task, relay, relay_task
 
     logger.info("Starting application")
 
@@ -44,6 +48,20 @@ async def lifespan(app: FastAPI):
         )
     )
     logger.info("Redis Stream consumer started")
+
+    if get_settings().RELAY_ENABLED:
+        relay = get_relay()
+        relay_task = asyncio.create_task(relay.start())
+        relay_task.add_done_callback(
+            lambda t: (
+                logger.error("Relay task died", error=str(t.exception()))
+                if not t.cancelled() and t.exception()
+                else None
+            )
+        )
+        logger.info("Outbox relay started")
+    else:
+        logger.info("Outbox relay disabled; rows will wait for another process")
 
     yield
 
@@ -69,6 +87,24 @@ async def lifespan(app: FastAPI):
         await consumer.close()
     logger.info("Redis Stream consumer stopped")
 
+    if relay:
+        await relay.stop()
+    if relay_task:
+        try:
+            # Let the in-flight batch finish before giving up on it.
+            await asyncio.wait_for(relay_task, timeout=10)
+        except TimeoutError:
+            logger.warning("Relay did not stop in time; cancelling")
+            relay_task.cancel()
+            await asyncio.gather(relay_task, return_exceptions=True)
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            # Whatever killed the relay must not skip the cleanup below.
+            logger.error("Relay task ended with error", error=str(e))
+        logger.info("Outbox relay stopped")
+
+    await close_relay()
     await close_producer()
     await close_db()
     logger.info("Connections closed")
