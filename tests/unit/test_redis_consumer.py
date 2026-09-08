@@ -5,6 +5,8 @@ from redis.exceptions import RedisError, ResponseError
 
 from messaging.consumer import redis_consumer as redis_consumer_module
 from messaging.consumer.redis_consumer import RedisConsumer
+from messaging.models import EventEnvelope, OrderCreatedEvent
+from storage.errors import PermanentHandlerError
 
 
 class FakeRedis:
@@ -50,6 +52,16 @@ def make_consumer():
 
 async def fast_sleep(_):
     return
+
+
+def valid_envelope_json():
+    envelope = EventEnvelope.create(
+        event_type="OrderCreated",
+        payload=OrderCreatedEvent(order_ref="r1", item="widget", quantity=1),
+        correlation_id="corr-1",
+        source="test",
+    )
+    return envelope.model_dump_json()
 
 
 async def test_ensure_group_reraises_non_busygroup_errors():
@@ -176,3 +188,44 @@ async def test_start_loop_stops_mid_batch_when_stop_is_requested(monkeypatch):
     await consumer.start()
 
     assert handled == ["1-0"]
+
+
+async def test_a_permanent_handler_error_is_dead_lettered_without_retries(monkeypatch):
+    calls = []
+
+    async def failing_dispatch(envelope):
+        calls.append(envelope)
+        raise PermanentHandlerError("no price for item: gizmo")
+
+    monkeypatch.setattr(redis_consumer_module, "dispatch_event", failing_dispatch)
+
+    consumer = make_consumer()
+
+    await consumer._handle_one("1-0", {"event": valid_envelope_json()})
+
+    assert len(calls) == 1, "a permanent error must not be retried"
+    stream, fields = consumer.redis.xadd_calls[0]
+    assert stream == consumer.dlq_stream
+    assert fields["reason"] == "permanent_handler_error"
+    assert consumer.redis.xack_calls == ["1-0"]
+
+
+async def test_a_generic_handler_error_still_retries(monkeypatch):
+    monkeypatch.setattr(redis_consumer_module.asyncio, "sleep", fast_sleep)
+    calls = []
+
+    async def failing_dispatch(envelope):
+        calls.append(envelope)
+        raise RuntimeError("transient")
+
+    monkeypatch.setattr(redis_consumer_module, "dispatch_event", failing_dispatch)
+
+    consumer = make_consumer()
+
+    await consumer._handle_one("1-0", {"event": valid_envelope_json()})
+
+    assert len(calls) == consumer.max_retries
+    stream, fields = consumer.redis.xadd_calls[0]
+    assert stream == consumer.dlq_stream
+    assert fields["reason"] == "handler_error"
+    assert consumer.redis.xack_calls == ["1-0"]

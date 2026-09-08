@@ -13,6 +13,7 @@ from config.logging import get_logger
 from config.settings import get_settings
 from messaging.consumer.dispatcher import dispatch_event
 from messaging.models import EventEnvelope
+from storage.errors import PermanentHandlerError
 
 logger = get_logger(__name__)
 
@@ -152,6 +153,19 @@ class RedisConsumer:
                 await dispatch_event(envelope)
                 await self.redis.xack(self.stream_name, self.consumer_group, message_id)
                 log.debug("Message handled and acked", attempt=attempt)
+                return
+            except PermanentHandlerError as e:
+                # No retries: a missing price, a malformed catalog, or an
+                # unpriced item fails identically forever. Same treatment
+                # ValidationError gets above, for the same reason.
+                log.warning("Handler failed permanently", error=str(e))
+                await self._dead_letter(
+                    message_id,
+                    fields,
+                    "permanent_handler_error",
+                    f"{e}\n{traceback.format_exc()}",
+                    attempt,
+                )
                 return
             except Exception as e:
                 last_error = f"{e}\n{traceback.format_exc()}"
