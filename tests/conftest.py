@@ -41,6 +41,77 @@ def redis_url() -> str:
 
 
 @pytest.fixture(scope="session")
+def seaweedfs_url() -> str:
+    """
+    Start SeaweedFS with its S3 gateway and yield the endpoint URL.
+
+    Deliberately the image docker-compose.yaml runs, not MinIO: an integration
+    test that passes against a different S3 implementation than the one the
+    template ships proves less than it appears to.
+    """
+    from testcontainers.core.container import DockerContainer
+    from testcontainers.core.waiting_utils import wait_for_logs
+
+    container = (
+        DockerContainer("chrislusf/seaweedfs:4.44")
+        .with_command(
+            "server -dir=/data -s3 -s3.port=8333 -volume.max=100 "
+            "-master.volumeSizeLimitMB=100 -master.volumePreallocate=false"
+        )
+        .with_exposed_ports(8333)
+    )
+    with container:
+        wait_for_logs(container, "Start Seaweed S3 API Server", timeout=90)
+        host = container.get_container_host_ip()
+        port = container.get_exposed_port(8333)
+        yield f"http://{host}:{port}"
+
+
+@pytest.fixture(scope="session")
+def s3_settings(app_settings, seaweedfs_url: str):
+    """
+    Point the cached settings at the SeaweedFS container.
+
+    Anonymous credentials: the container runs without an -s3.config file, so
+    it accepts any key. The values still have to be set, because botocore
+    refuses to sign a request with no credentials at all.
+    """
+    from config.settings import get_settings
+
+    os.environ["S3_ENDPOINT_URL"] = seaweedfs_url
+    os.environ["S3_BUCKET"] = "test-bucket"
+    os.environ["S3_ACCESS_KEY_ID"] = "test"
+    os.environ["S3_SECRET_ACCESS_KEY"] = "test"
+    os.environ["PRICES_CACHE_TTL_S"] = "1"
+    get_settings.cache_clear()
+    yield get_settings()
+    get_settings.cache_clear()
+
+
+@pytest_asyncio.fixture
+async def object_store(s3_settings):
+    """
+    An opened S3ObjectStore with an empty bucket.
+
+    Function-scoped because aioboto3's client binds to the event loop that
+    created it, and pytest-asyncio gives each test its own loop — the same
+    constraint _reset_session_maker_globals handles for SQLAlchemy.
+    """
+    from storage.s3.client import S3ObjectStore
+
+    store = S3ObjectStore()
+    await store.open()
+    await store.ensure_bucket()
+    try:
+        yield store
+    finally:
+        await store.close()
+        import storage.s3.client as client_module
+
+        client_module._store = None
+
+
+@pytest.fixture(scope="session")
 def app_settings(postgres_url: str, redis_url: str):
     """
     Point the application's cached settings at the containers.
