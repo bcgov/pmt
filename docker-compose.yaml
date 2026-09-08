@@ -24,6 +24,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      bucket-init:
+        condition: service_completed_successfully
 
   db:
     image: postgres:18
@@ -54,5 +56,72 @@ services:
       timeout: 3s
       retries: 15
 
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.44
+    command: >
+      server
+      -dir=/data
+      -s3
+      -s3.port=8333
+      -s3.config=/etc/seaweedfs/config.json
+      -volume.max=100
+      -master.volumeSizeLimitMB=100
+      -master.volumePreallocate=false
+    ports:
+      - "8333:8333"
+      - "9333:9333"
+    volumes:
+      - seaweeddata:/data
+      - ./seaweedfs/config.json:/etc/seaweedfs/config.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8333/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+
+  bucket-init:
+    image: amazon/aws-cli:2.31.9
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: dev
+      AWS_SECRET_ACCESS_KEY: dev
+      AWS_DEFAULT_REGION: us-east-1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        endpoint=http://seaweedfs:8333
+        bucket=pmt-bucket
+        if aws --endpoint-url "$$endpoint" s3api head-bucket --bucket "$$bucket" 2>/dev/null; then
+          echo "bucket $$bucket already exists"
+        else
+          aws --endpoint-url "$$endpoint" s3 mb "s3://$$bucket"
+        fi
+        aws --endpoint-url "$$endpoint" s3api head-bucket --bucket "$$bucket"
+        echo "bucket ready: $$bucket"
+
+  s3-put:
+    image: amazon/aws-cli:2.31.9
+    profiles: ["smoke"]
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    environment:
+      AWS_ACCESS_KEY_ID: dev
+      AWS_SECRET_ACCESS_KEY: dev
+      AWS_DEFAULT_REGION: us-east-1
+      BUCKET: pmt-bucket
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        aws --endpoint-url http://seaweedfs:8333 s3 cp - "s3://$$BUCKET/$$KEY"
+        aws --endpoint-url http://seaweedfs:8333 s3api head-object --bucket "$$BUCKET" --key "$$KEY" >/dev/null
+        echo "uploaded s3://$$BUCKET/$$KEY"
+
 volumes:
   pmt_pgdata:
+  seaweeddata:
