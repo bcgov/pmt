@@ -6,6 +6,10 @@ Streams, and priced from a catalog in S3-compatible object storage
 (SeaweedFS in this template). Read it end to end, then replace the slice with
 your own domain.
 
+For transaction boundaries, delivery guarantees, implementation trade-offs, and
+domain replacement guidance, read the
+[Implementation & Architecture Guide](docs/IMPLEMENTATION_GUIDE.md).
+
 ---
 
 ## Quickstart
