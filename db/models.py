@@ -32,6 +32,11 @@ class Order(Base):
     item: Mapped[str] = mapped_column(String(255), nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
 
+    # Money is stored in cents as an integer — never a float, never a
+    # NUMERIC that invites Decimal round-tripping. BIGINT rather than INT
+    # because a 32-bit column caps out near $21M.
+    total_cents: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
     # pending | confirmed
     status: Mapped[str] = mapped_column(
         String(50), nullable=False, default="pending", index=True
