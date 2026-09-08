@@ -2,7 +2,9 @@
 
 An async FastAPI microservice template with a working reference slice: an
 `orders` API backed by PostgreSQL, publishing and consuming events over Redis
-Streams. Read it end to end, then replace the slice with your own domain.
+Streams, and priced from a catalog in S3-compatible object storage
+(SeaweedFS in this template). Read it end to end, then replace the slice with
+your own domain.
 
 ---
 
@@ -11,6 +13,7 @@ Streams. Read it end to end, then replace the slice with your own domain.
 ```bash
 make up      # docker compose up --build -d; runs migrations, starts the API
 make demo    # POST an order, wait for the consumer, GET it back
+make demo-s3 # same, but priced from S3 and rolled up into a daily object
 ```
 
 Expected output:
@@ -78,6 +81,11 @@ The `orders` slice exists to be replaced. Edit these seven files, in order:
 6. `messaging/consumer/dispatcher.py` — register the handler in `HANDLERS`.
 7. `core/services/order_service.py` and `api/routes/orders.py` — your service
    and routes.
+
+`storage/` (the S3 object-storage layer — price catalog, rollups) is part of
+the reference slice, not core infrastructure: keep it if your domain also
+reads or writes object storage, delete it along with SeaweedFS in
+`docker-compose.yaml` otherwise.
 
 Then generate and apply a migration for your table:
 
@@ -194,6 +202,27 @@ retention window; `failed` rows are never swept.
 - The relay shares the API's process and event loop. Moving it to its own
   container is a deployment change, not a code change — set `RELAY_ENABLED=false`
   on the API and true on one dedicated deployment.
+
+---
+
+## Storage
+
+The `OrderCreated` handler prices the order from a catalog in S3-compatible
+object storage, then rebuilds a daily rollup object — `storage/` (beside
+`db/` and `messaging/`) is the layer that does that. The HTTP write path
+never touches S3; only the consumer does.
+
+`docker-compose.yaml` runs SeaweedFS as that object store, with a
+`bucket-init` service that creates `pmt-bucket` and seeds
+`config/prices.json` so the first order has something to price against.
+
+Settings: `S3_ENDPOINT_URL`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`,
+`S3_SECRET_ACCESS_KEY`, `S3_PRICES_KEY` (default `config/prices.json`),
+`S3_ROLLUP_PREFIX` (default `rollups/`), `PRICES_CACHE_TTL_S` — how long the
+parsed catalog is cached before revalidating with `If-None-Match`.
+
+Run `make demo-s3` to watch it end to end: the seeded catalog, an order
+priced from it, and the rollup object the consumer wrote.
 
 ---
 

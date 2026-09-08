@@ -192,6 +192,9 @@ block the event loop that also serves HTTP.
   `messaging/models/envelope.py`, write a handler under
   `messaging/consumer/handlers/`, and register it in `HANDLERS` in
   `messaging/consumer/dispatcher.py`.
+- A handler raising `PermanentHandlerError` (`storage/errors.py`) is
+  dead-lettered immediately with reason `permanent_handler_error`, no retries —
+  the same treatment a `ValidationError` gets, for the same reason.
 
 ## Outbox
 
@@ -216,6 +219,41 @@ lifespan and publishes those rows.
   failed.
 - Delivery is at-least-once by design. Handlers must be idempotent.
 - New event types need no relay change — the relay is domain-agnostic.
+
+## Storage
+
+`storage/` is the object-storage layer, beside `db/` and `messaging/`. The
+`OrderCreated` handler reads a price catalog from S3, writes the total to
+Postgres, and rebuilds a daily rollup object — the HTTP write path never
+touches S3.
+
+- `storage/object_store.py` defines the `ObjectStore` Protocol. Depend on it,
+  not on `aioboto3`; that is what lets every unit test run against
+  `storage/fake.py` with no Docker.
+- `storage/s3/client.py` holds one long-lived `aioboto3` client, opened in the
+  lifespan. botocore's own retries are disabled — retry policy lives in the
+  consumer, and two layers would multiply.
+- `storage/errors.py` classifies failures the way `messaging/outbox/backoff.py`
+  does for Redis, with one difference: `ClientError` covers both a 503 and a
+  `NoSuchKey`, so it branches on the response code, not the exception class.
+  A `PermanentHandlerError` is dead-lettered by the consumer with no retries.
+- **Money is integers.** `unit_price_cents` in the catalog, `total_cents
+  BIGINT` in Postgres, `total_cents` in the API response. One representation,
+  no conversion boundary. `PriceItem.unit_price_cents` is a `StrictInt`, so a
+  `19.99` in the catalog is a validation failure rather than a truncation.
+- **The rollup object is a projection, never an accumulator.**
+  `RollupService.rebuild_for_date` selects the day from SQL and overwrites the
+  key; it never reads what is there. Concurrent writers race harmlessly
+  because they all compute from the same authoritative rows. Do not turn this
+  into a read-modify-write — that needs conditional PUTs and a retry loop to
+  avoid losing updates.
+- **The rollup is rebuilt on every delivery, including redeliveries** whose
+  `confirm()` affected zero rows. Skipping it looks like an optimization and
+  breaks recovery: a PUT that failed after a successful commit would never be
+  retried, because the retry's `confirm()` is a no-op.
+- `PriceCatalog` caches the parsed catalog for `PRICES_CACHE_TTL_S` and then
+  revalidates with `If-None-Match`. A failed revalidation propagates without
+  discarding the cached copy.
 
 ## Code Style
 
