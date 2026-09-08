@@ -6,8 +6,20 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from messaging.consumer import RedisConsumer
+from messaging.outbox.relay import OutboxRelay
 
 pytestmark = pytest.mark.integration
+
+
+@pytest.fixture
+async def running_relay(app_settings, migrated_db, redis_client):
+    """A live relay for the duration of one test."""
+    relay = OutboxRelay()
+    task = asyncio.create_task(relay.start())
+    yield relay
+    await relay.stop()
+    await asyncio.wait_for(task, timeout=10)
+    await relay.close()
 
 
 @pytest.fixture
@@ -23,11 +35,12 @@ async def running_consumer(app_settings, migrated_db, redis_client):
 
 
 async def test_order_goes_from_pending_to_confirmed(
-    app_settings, running_consumer, redis_client, db_session
+    app_settings, running_relay, running_consumer, redis_client, db_session
 ):
     """
-    POST /orders -> row committed pending + event published -> consumer
-    confirms it -> GET shows confirmed. The whole template in one test.
+    POST /orders -> order row and outbox row commit together -> relay
+    publishes -> consumer confirms -> GET shows confirmed. The whole template
+    in one test.
     """
     from main import app
 
