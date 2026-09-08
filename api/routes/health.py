@@ -31,6 +31,13 @@ async def _check_redis() -> str:
         await client.aclose()
 
 
+async def _check_s3() -> str:
+    from storage.s3.client import get_object_store
+
+    await get_object_store().head_bucket()
+    return "ok"
+
+
 @router.get("", summary="Health check")
 async def health_check(response: Response):
     """
@@ -42,7 +49,11 @@ async def health_check(response: Response):
     """
     details: dict[str, str] = {}
 
-    for name, probe in (("postgres", _check_postgres), ("redis", _check_redis)):
+    for name, probe in (
+        ("postgres", _check_postgres),
+        ("redis", _check_redis),
+        ("s3", _check_s3),
+    ):
         try:
             details[name] = await asyncio.wait_for(
                 probe(), timeout=PROBE_TIMEOUT_SECONDS

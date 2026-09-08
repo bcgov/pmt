@@ -5,15 +5,17 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
-from api.routes import health, info, orders
+from api.routes import health, info, orders, rollups
 from config.logging import configure_logging, get_logger
 from config.request_logger import RequestLoggingMiddleware
 from config.settings import get_settings
 from config.tracing import init_tracing
+from core.services.pricing import reset_price_catalog
 from db.postgres.session import close_db
 from messaging.consumer import RedisConsumer
 from messaging.outbox import close_relay, get_relay
 from messaging.producer.redis_producer import close_producer
+from storage.s3.client import close_object_store, get_object_store
 
 configure_logging()
 
@@ -37,6 +39,9 @@ async def lifespan(app: FastAPI):
     global consumer, consumer_task, relay, relay_task
 
     logger.info("Starting application")
+
+    await get_object_store().open()
+    logger.info("S3 object store opened")
 
     consumer = RedisConsumer()
     consumer_task = asyncio.create_task(consumer.start())
@@ -107,6 +112,8 @@ async def lifespan(app: FastAPI):
         logger.info("Outbox relay stopped")
 
     await close_relay()
+    reset_price_catalog()
+    await close_object_store()
     await close_producer()
     await close_db()
     logger.info("Connections closed")
@@ -145,6 +152,7 @@ init_tracing(app)
 app.include_router(health.router)
 app.include_router(info.router)
 app.include_router(orders.router)
+app.include_router(rollups.router)
 
 
 # -----------------------------------------------------------

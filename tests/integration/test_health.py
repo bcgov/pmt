@@ -4,7 +4,11 @@ from httpx import ASGITransport, AsyncClient
 pytestmark = pytest.mark.integration
 
 
-async def test_health_reports_both_dependencies(app_settings, migrated_db):
+async def test_health_reports_all_dependencies(app_settings, object_store, migrated_db):
+    import storage.s3.client as client_module
+
+    client_module._store = object_store
+
     from main import app
 
     transport = ASGITransport(app=app)
@@ -14,4 +18,4 @@ async def test_health_reports_both_dependencies(app_settings, migrated_db):
     assert response.status_code == 200
     body = response.json()
     assert body["status"] == "ok"
-    assert body["services"] == {"postgres": "ok", "redis": "ok"}
+    assert body["services"] == {"postgres": "ok", "redis": "ok", "s3": "ok"}

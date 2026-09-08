@@ -21,6 +21,9 @@ class OrderResponse(BaseModel):
     order_ref: str
     item: str
     quantity: int
+    # Cents, as stored. No formatted variant: one representation from the
+    # price catalog through Postgres to here means nothing to convert.
+    total_cents: int | None = None
     status: str
     confirmed_at: datetime | None
     created_at: datetime
