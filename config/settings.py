@@ -1,4 +1,5 @@
 # config/settings.py
+from datetime import date
 from functools import lru_cache
 from typing import Optional
 
@@ -50,6 +51,20 @@ class Settings(BaseSettings):
     OUTBOX_SWEEP_INTERVAL_S: int = 300
 
     # -------------------------
+    # Object storage (S3 API)
+    # -------------------------
+    S3_ENDPOINT_URL: str = "http://localhost:8333"
+    S3_REGION: str = "us-east-1"
+    S3_BUCKET: str = "pmt-bucket"
+    S3_ACCESS_KEY_ID: str = "dev"
+    S3_SECRET_ACCESS_KEY: str = "dev"
+    S3_PRICES_KEY: str = "config/prices.json"
+    S3_ROLLUP_PREFIX: str = "rollups/"
+    S3_CONNECT_TIMEOUT_S: int = 2
+    S3_READ_TIMEOUT_S: int = 5
+    PRICES_CACHE_TTL_S: int = 60
+
+    # -------------------------
     # Logging
     # -------------------------
     LOG_LEVEL: str = "INFO"
@@ -74,6 +89,10 @@ class Settings(BaseSettings):
     def dlq_stream(self) -> str:
         """Dead-letter stream; defaults to '<STREAM_NAME>:dlq'."""
         return self.DLQ_STREAM_NAME or f"{self.STREAM_NAME}:dlq"
+
+    def rollup_key(self, day: date) -> str:
+        """Object key for one day's rollup: '<prefix><YYYY-MM-DD>.json'."""
+        return f"{self.S3_ROLLUP_PREFIX}{day.isoformat()}.json"
 
 
 @lru_cache

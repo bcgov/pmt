@@ -21,6 +21,9 @@ asyncpg = "^0.31.0"
 # --- Redis ---
 redis = "^7.1.0"
 
+# --- Object storage (S3 API) ---
+aioboto3 = "^15.4.0"
+
 # --- Config ---
 pydantic-settings = "^2.12.0"
 
