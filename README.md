@@ -136,19 +136,64 @@ zero rows, logs it, and acks normally.
 
 ---
 
-## Known limitation: no transactional outbox
+## Outbox
 
-The database commit and the `XADD` publish are two separate operations, not
-one atomic unit. If the commit succeeds but the publish fails, the API still
-returns `201` with `status: "pending"` — the row is real, the event is not,
-and the response reflects that truthfully rather than pretending otherwise.
+`POST /orders` writes two rows in one transaction: the order, and its
+`OrderCreated` event in the `outbox` table. It never talks to Redis. A `201`
+therefore means the event will be published, not that it has been.
 
-A production service closes this gap with a transactional outbox: write the
-event to an outbox table in the same transaction as the domain row, then have
-a separate relay process poll the outbox and publish, marking rows as sent.
-This template omits it deliberately — it adds a second table and a second
-background loop, roughly doubling the code for a reference slice whose job is
-to demonstrate the event flow clearly, not to be production-hardened.
+`OutboxRelay` (`messaging/outbox/relay.py`) runs as a background task beside
+the consumer. Each pass claims a batch with
+`SELECT ... WHERE status='pending' ORDER BY id FOR UPDATE SKIP LOCKED`,
+publishes each row's stored payload with `XADD`, and marks it `published` — all
+in the transaction that claimed it. `create_order` nudges the relay after
+committing so the event does not wait out the poll interval; the poll is still
+what guarantees delivery.
+
+`payload` is `TEXT`, not `JSONB`, on purpose: the writer serializes the
+validated envelope once and the relay publishes that exact string. JSONB would
+reorder keys and strip whitespace, and the relay would have to re-encode what
+it was given.
+
+Failure handling splits by cause:
+
+- **Redis unreachable** (`ConnectionError`, `TimeoutError`, `BusyLoadingError`,
+  `ReadOnlyError`): the row stays `pending`, `attempts` grows, and
+  `next_attempt_at` backs off exponentially up to `OUTBOX_MAX_BACKOFF_MS`. The
+  batch stops there — if Redis is down for one row it is down for all of them,
+  and stopping preserves publish order.
+- **Permanent rejection** (`WRONGTYPE`, an oversized payload, a corrupt row):
+  the row becomes `failed` with `failed_at` and `last_error`, and the batch
+  keeps going so one bad row cannot block the rest.
+
+A `failed` row is the dead letter. There is no relay DLQ stream: the row
+already holds the payload, the error and the timestamps, and marking it must
+not depend on the Redis write that just failed. Query them with
+`SELECT * FROM outbox WHERE status = 'failed'`.
+
+Settings: `RELAY_ENABLED`, `OUTBOX_POLL_INTERVAL_MS`, `OUTBOX_BATCH_SIZE`,
+`OUTBOX_RETRY_BACKOFF_MS`, `OUTBOX_MAX_BACKOFF_MS`, `OUTBOX_RETENTION_HOURS`,
+`OUTBOX_SWEEP_INTERVAL_S`. Published rows are swept once they age past the
+retention window; `failed` rows are never swept.
+
+### What this still does not give you
+
+- Delivery is at-least-once. A crash between `XADD` and the marking commit
+  republishes the row, so handlers must be idempotent — the order handler's
+  conditional `UPDATE ... WHERE status='pending'` is the pattern.
+- One relay transaction covers a whole batch, so that crash republishes every
+  row already published in the batch, not just one. Lower `OUTBOX_BATCH_SIZE`
+  to narrow the window, at the cost of more database transactions.
+- The batch's `XADD` calls run inside the open transaction, so a slow Redis
+  keeps a pooled connection checked out and delays `VACUUM` cleanup for as
+  long as the batch runs.
+- Publish order is not guaranteed globally across replicas: `SKIP LOCKED` lets
+  a later row overtake an earlier one another relay holds. Per-aggregate
+  ordering needs partitioning by `correlation_id`, which this template does
+  not do.
+- The relay shares the API's process and event loop. Moving it to its own
+  container is a deployment change, not a code change — set `RELAY_ENABLED=false`
+  on the API and true on one dedicated deployment.
 
 ---
 

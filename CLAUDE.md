@@ -61,15 +61,16 @@ poetry add --group dev <package-name>
    - `api/routes/models.py`: `CreateOrderRequest`, `OrderResponse`.
 
 2. **Core Layer** (`core/services/`): Application services that sequence data
-   and messaging work. `order_service.py` commits the order row, then
-   publishes `OrderCreated`; a publish failure still returns 201 with
-   `status: "pending"` since the row is real regardless.
+   and messaging work. `order_service.py` writes the order row and its
+   `OrderCreated` event to the `outbox` table in one transaction and never
+   publishes; the relay does that afterwards.
 
 3. **Data Access Layer** (`db/`): PostgreSQL via SQLAlchemy 2.0 async.
    - `db/postgres/session.py`: async engine, session maker, `get_db()`
      dependency. Does **not** create tables — that's Alembic's job.
    - `db/models.py`: ORM models (`Order`).
-   - `db/repositories/`: query logic (`order_repository.py`).
+   - `db/repositories/`: query logic (`order_repository.py`,
+     `outbox_repository.py`).
    - `db/migrations/`: Alembic environment and revisions — see Migrations
      below.
 
@@ -84,6 +85,9 @@ poetry add --group dev <package-name>
      (`order_created.py`).
    - `messaging/models/`: `EventEnvelope`, `EventPayload`, and per-event
      payload models (`events/order_created.py`).
+   - `messaging/outbox/relay.py`: `OutboxRelay` — claims `outbox` rows with
+     `SKIP LOCKED` and publishes them; `messaging/outbox/backoff.py` classifies
+     Redis errors as retryable or permanent.
 
 5. **Configuration Layer** (`config/`):
    - `settings.py`: Pydantic Settings for env var validation.
@@ -188,6 +192,30 @@ block the event loop that also serves HTTP.
   `messaging/models/envelope.py`, write a handler under
   `messaging/consumer/handlers/`, and register it in `HANDLERS` in
   `messaging/consumer/dispatcher.py`.
+
+## Outbox
+
+`core/services/order_service.py` writes the domain row and its event in one
+transaction — the event goes to the `outbox` table, never straight to Redis.
+`messaging/outbox/relay.py` (`OutboxRelay`) runs as a background task in the
+lifespan and publishes those rows.
+
+- `payload` is `TEXT` holding the exact serialized `EventEnvelope`. The relay
+  never parses it. Do not change this column to `JSONB` — JSONB reorders keys
+  and strips whitespace, so it cannot return the bytes the writer produced.
+- One transaction per batch: claim with `FOR UPDATE SKIP LOCKED`, `XADD` each
+  row, mark each `published`, commit. A crash mid-batch republishes every row
+  already published in it; `OUTBOX_BATCH_SIZE` bounds that.
+- Redis being unreachable is retryable — the row stays `pending` with an
+  exponential backoff and the batch stops. Anything else is permanent: the row
+  becomes `failed` and the batch continues. `messaging/outbox/backoff.py`
+  draws that line, and the retryable check must precede any `ResponseError`
+  handling because `ReadOnlyError` and `BusyLoadingError` subclass it.
+- A `failed` row is the dead letter. The relay never publishes to
+  `DLQ_STREAM_NAME`; SQL stays authoritative because Redis is what may have
+  failed.
+- Delivery is at-least-once by design. Handlers must be idempotent.
+- New event types need no relay change — the relay is domain-agnostic.
 
 ## Code Style
 
