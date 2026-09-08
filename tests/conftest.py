@@ -67,7 +67,7 @@ def seaweedfs_url() -> str:
         yield f"http://{host}:{port}"
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def s3_settings(app_settings, seaweedfs_url: str):
     """
     Point the cached settings at the SeaweedFS container.
@@ -75,17 +75,33 @@ def s3_settings(app_settings, seaweedfs_url: str):
     Anonymous credentials: the container runs without an -s3.config file, so
     it accepts any key. The values still have to be set, because botocore
     refuses to sign a request with no credentials at all.
+
+    Function-scoped (unlike the container it points at, which is session-
+    scoped and reused): a session-scoped override here would leak these env
+    vars to every test that runs afterward in the same session, since a
+    session fixture only tears down once, at the very end.
     """
     from config.settings import get_settings
 
-    os.environ["S3_ENDPOINT_URL"] = seaweedfs_url
-    os.environ["S3_BUCKET"] = "test-bucket"
-    os.environ["S3_ACCESS_KEY_ID"] = "test"
-    os.environ["S3_SECRET_ACCESS_KEY"] = "test"
-    os.environ["PRICES_CACHE_TTL_S"] = "1"
+    overrides = {
+        "S3_ENDPOINT_URL": seaweedfs_url,
+        "S3_BUCKET": "test-bucket",
+        "S3_ACCESS_KEY_ID": "test",
+        "S3_SECRET_ACCESS_KEY": "test",
+        "PRICES_CACHE_TTL_S": "1",
+    }
+    previous = {key: os.environ.get(key) for key in overrides}
+    os.environ.update(overrides)
     get_settings.cache_clear()
-    yield get_settings()
-    get_settings.cache_clear()
+    try:
+        yield get_settings()
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        get_settings.cache_clear()
 
 
 @pytest_asyncio.fixture
