@@ -5,6 +5,7 @@ from core.services.pricing import (
     get_price_catalog,
     reset_price_catalog,
 )
+from core.services.rollup_service import RollupService
 
 __all__ = [
     "OrderService",
@@ -13,4 +14,5 @@ __all__ = [
     "PriceCatalogDocument",
     "get_price_catalog",
     "reset_price_catalog",
+    "RollupService",
 ]
