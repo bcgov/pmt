@@ -5,6 +5,7 @@ import traceback
 from datetime import UTC, datetime
 from uuid import uuid4
 
+from botocore.exceptions import ClientError
 from pydantic import ValidationError
 from redis.asyncio import Redis
 from redis.exceptions import RedisError, ResponseError
@@ -13,7 +14,7 @@ from config.logging import get_logger
 from config.settings import get_settings
 from messaging.consumer.dispatcher import dispatch_event
 from messaging.models import EventEnvelope
-from storage.errors import PermanentHandlerError
+from storage.errors import PermanentHandlerError, is_retryable
 
 logger = get_logger(__name__)
 
@@ -167,6 +168,32 @@ class RedisConsumer:
                     attempt,
                 )
                 return
+            except ClientError as e:
+                if not is_retryable(e):
+                    # No retries: an S3 permission or configuration error
+                    # (e.g. AccessDenied) fails identically forever, the same
+                    # reasoning as PermanentHandlerError above.
+                    log.warning(
+                        "Handler failed with a permanent storage error", error=str(e)
+                    )
+                    await self._dead_letter(
+                        message_id,
+                        fields,
+                        "permanent_storage_error",
+                        f"{e}\n{traceback.format_exc()}",
+                        attempt,
+                    )
+                    return
+                last_error = f"{e}\n{traceback.format_exc()}"
+                log.warning(
+                    "Handler failed",
+                    attempt=attempt,
+                    max_retries=self.max_retries,
+                    error=str(e),
+                )
+                if attempt < self.max_retries:
+                    backoff = self.retry_backoff_ms * (2 ** (attempt - 1)) / 1000
+                    await asyncio.sleep(backoff)
             except Exception as e:
                 last_error = f"{e}\n{traceback.format_exc()}"
                 log.warning(

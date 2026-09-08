@@ -59,14 +59,22 @@ class S3ObjectStore:
         self._client = None
         logger.debug("S3 client closed")
 
+    def _require_open(self) -> None:
+        if self._client is None:
+            raise RuntimeError(
+                "S3 client not opened; call open() from the app lifespan"
+            )
+
     async def ensure_bucket(self) -> None:
         """Create the bucket if absent. For tests and local bootstrapping."""
+        self._require_open()
         try:
             await self._client.head_bucket(Bucket=self.bucket)
         except ClientError:
             await self._client.create_bucket(Bucket=self.bucket)
 
     async def get(self, key: str) -> ObjectData | None:
+        self._require_open()
         try:
             response = await self._client.get_object(Bucket=self.bucket, Key=key)
         except ClientError as e:
@@ -79,6 +87,7 @@ class S3ObjectStore:
     async def get_if_none_match(
         self, key: str, etag: str
     ) -> ObjectData | NotModified | None:
+        self._require_open()
         try:
             response = await self._client.get_object(
                 Bucket=self.bucket, Key=key, IfNoneMatch=etag
@@ -96,12 +105,14 @@ class S3ObjectStore:
         return ObjectData(body=body, etag=response["ETag"])
 
     async def put(self, key: str, body: bytes, content_type: str) -> None:
+        self._require_open()
         await self._client.put_object(
             Bucket=self.bucket, Key=key, Body=body, ContentType=content_type
         )
         logger.debug("Object written", key=key, bytes=len(body))
 
     async def head_bucket(self) -> None:
+        self._require_open()
         await self._client.head_bucket(Bucket=self.bucket)
 
 

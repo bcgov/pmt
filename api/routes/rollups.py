@@ -21,15 +21,24 @@ async def get_rollup(day: date) -> Response:
     object is the artifact, and re-encoding it would hide a malformed write
     instead of surfacing it. FastAPI's `date` conversion gives a 422 for a
     malformed path segment for free.
+
+    A retryable store failure (e.g. a timeout) is a 503: the caller should try
+    again. A permanent one (e.g. AccessDenied, NoSuchBucket) is a 500: it is a
+    server misconfiguration, and telling the caller to retry would be wrong.
     """
     key = get_settings().rollup_key(day)
     try:
         obj = await get_object_store().get(key)
     except Exception as e:
         logger.warning("Rollup fetch failed", key=key, error=str(e))
-        detail = "object store unavailable" if is_retryable(e) else "object store error"
+        if is_retryable(e):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="object store unavailable",
+            ) from e
         raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=detail
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="object store error",
         ) from e
 
     if obj is None:

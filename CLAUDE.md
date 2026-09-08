@@ -195,6 +195,13 @@ block the event loop that also serves HTTP.
 - A handler raising `PermanentHandlerError` (`storage/errors.py`) is
   dead-lettered immediately with reason `permanent_handler_error`, no retries —
   the same treatment a `ValidationError` gets, for the same reason.
+- A non-retryable `ClientError` from S3 (e.g. `AccessDenied`) is dead-lettered
+  immediately with reason `permanent_storage_error`, no retries; a retryable
+  one (e.g. a 503) retries like a generic handler error.
+- An `OrderCreated` event whose order row is missing when the handler looks
+  it up now raises `PermanentHandlerError` and dead-letters, instead of the
+  silent acked-and-ignored behavior from before S3 was added — the handler
+  needs the order's `created_at` to pick a rollup key.
 
 ## Outbox
 
@@ -243,14 +250,23 @@ touches S3.
   `19.99` in the catalog is a validation failure rather than a truncation.
 - **The rollup object is a projection, never an accumulator.**
   `RollupService.rebuild_for_date` selects the day from SQL and overwrites the
-  key; it never reads what is there. Concurrent writers race harmlessly
-  because they all compute from the same authoritative rows. Do not turn this
-  into a read-modify-write — that needs conditional PUTs and a retry loop to
-  avoid losing updates.
+  key; it never reads what is there. Concurrent writers race on the same key
+  with plain last-write-wins, which is not always correct: a slow writer can
+  overwrite a faster one's more-complete object, losing an order from the
+  rollup. That gap converges on the next delivery for that day — the next
+  rebuild recomputes from SQL and includes the lost row — but if no later
+  order arrives that day, the loss can persist indefinitely. A strict
+  guarantee, if ever needed, would take a per-day advisory lock around the
+  SELECT+PUT (e.g. `pg_advisory_xact_lock(hash(day))`) or a conditional PUT
+  with `If-Match` and a retry loop — do not add this speculatively.
 - **The rollup is rebuilt on every delivery, including redeliveries** whose
   `confirm()` affected zero rows. Skipping it looks like an optimization and
   breaks recovery: a PUT that failed after a successful commit would never be
-  retried, because the retry's `confirm()` is a no-op.
+  retried, because the retry's `confirm()` is a no-op. This means the object
+  is serialized from every row in the day on every delivery — O(N^2) total
+  work per day and an unbounded object — which is fine to roughly the low
+  thousands of orders per day. Past that, debounce the rebuild (e.g. only
+  rebuild once per N deliveries or on a timer) or shard the key by hour.
 - `PriceCatalog` caches the parsed catalog for `PRICES_CACHE_TTL_S` and then
   revalidates with `If-None-Match`. A failed revalidation propagates without
   discarding the cached copy.

@@ -218,7 +218,8 @@ never touches S3; only the consumer does.
 
 Settings: `S3_ENDPOINT_URL`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`,
 `S3_SECRET_ACCESS_KEY`, `S3_PRICES_KEY` (default `config/prices.json`),
-`S3_ROLLUP_PREFIX` (default `rollups/`), `PRICES_CACHE_TTL_S` — how long the
+`S3_ROLLUP_PREFIX` (default `rollups/`), `S3_CONNECT_TIMEOUT_S` (default `2`),
+`S3_READ_TIMEOUT_S` (default `5`), `PRICES_CACHE_TTL_S` — how long the
 parsed catalog is cached before revalidating with `If-None-Match`.
 
 Run `make demo-s3` to watch it end to end: the seeded catalog, an order

@@ -1,6 +1,7 @@
 # tests/unit/test_redis_consumer.py
 
 import pytest
+from botocore.exceptions import ClientError
 from redis.exceptions import RedisError, ResponseError
 
 from messaging.consumer import redis_consumer as redis_consumer_module
@@ -217,6 +218,51 @@ async def test_a_generic_handler_error_still_retries(monkeypatch):
     async def failing_dispatch(envelope):
         calls.append(envelope)
         raise RuntimeError("transient")
+
+    monkeypatch.setattr(redis_consumer_module, "dispatch_event", failing_dispatch)
+
+    consumer = make_consumer()
+
+    await consumer._handle_one("1-0", {"event": valid_envelope_json()})
+
+    assert len(calls) == consumer.max_retries
+    stream, fields = consumer.redis.xadd_calls[0]
+    assert stream == consumer.dlq_stream
+    assert fields["reason"] == "handler_error"
+    assert consumer.redis.xack_calls == ["1-0"]
+
+
+def make_client_error(code: str) -> ClientError:
+    return ClientError({"Error": {"Code": code}}, "PutObject")
+
+
+async def test_a_permanent_storage_error_is_dead_lettered_without_retries(monkeypatch):
+    calls = []
+
+    async def failing_dispatch(envelope):
+        calls.append(envelope)
+        raise make_client_error("AccessDenied")
+
+    monkeypatch.setattr(redis_consumer_module, "dispatch_event", failing_dispatch)
+
+    consumer = make_consumer()
+
+    await consumer._handle_one("1-0", {"event": valid_envelope_json()})
+
+    assert len(calls) == 1, "a permanent storage error must not be retried"
+    stream, fields = consumer.redis.xadd_calls[0]
+    assert stream == consumer.dlq_stream
+    assert fields["reason"] == "permanent_storage_error"
+    assert consumer.redis.xack_calls == ["1-0"]
+
+
+async def test_a_retryable_storage_error_still_retries(monkeypatch):
+    monkeypatch.setattr(redis_consumer_module.asyncio, "sleep", fast_sleep)
+    calls = []
+
+    async def failing_dispatch(envelope):
+        calls.append(envelope)
+        raise make_client_error("503")
 
     monkeypatch.setattr(redis_consumer_module, "dispatch_event", failing_dispatch)
 

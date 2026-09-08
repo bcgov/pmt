@@ -18,11 +18,16 @@ class RollupService:
     The object is a projection, not an accumulator: this rebuilds the whole
     day from SQL and overwrites the key. It never reads what is there.
 
-    That is what makes concurrency a non-problem. Several consumers can race
-    on the same key; the last write wins, and the winner is correct because
-    every writer computed from the same authoritative rows. Merging into the
-    existing object instead would need a conditional PUT and a retry loop to
-    avoid losing updates.
+    Concurrent writers race on the same key with plain last-write-wins, which
+    is NOT always correct: if consumer A reads before consumer B's order
+    commits but writes after B's PUT, A's object overwrites B's more-complete
+    one and B's order is missing from the rollup. The gap converges on the
+    next delivery for that day — the next rebuild recomputes from SQL and
+    includes the lost row — but if no later order arrives that day, the lost
+    update can persist indefinitely. If a strict guarantee is ever needed,
+    take a per-day advisory lock around the SELECT+PUT (e.g.
+    `pg_advisory_xact_lock(hash(day))`) or use a conditional PUT with
+    `If-Match` and retry on conflict.
     """
 
     def __init__(self, session: AsyncSession, store: ObjectStore) -> None:
