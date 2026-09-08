@@ -1,6 +1,7 @@
 # tests/integration/test_order_roundtrip.py
 
 import asyncio
+import json
 
 import pytest
 from httpx import ASGITransport, AsyncClient
@@ -9,6 +10,28 @@ from messaging.consumer import RedisConsumer
 from messaging.outbox.relay import OutboxRelay
 
 pytestmark = pytest.mark.integration
+
+CATALOG = json.dumps(
+    {"currency": "USD", "items": {"widget": {"unit_price_cents": 1999}}}
+).encode()
+
+
+@pytest.fixture(autouse=True)
+async def _wire_object_store(object_store):
+    """
+    The consumer's OrderCreated handler prices from S3 through the
+    process-wide get_object_store() singleton, not through injection. Point
+    it at this test's already-opened store and seed the catalog it needs, the
+    same way tests/integration/test_order_created_handler.py does.
+    """
+    import storage.s3.client as client_module
+    from core.services import pricing as pricing_module
+
+    client_module._store = object_store
+    pricing_module._catalog = None
+    await object_store.put("config/prices.json", CATALOG, "application/json")
+    yield
+    pricing_module._catalog = None
 
 
 @pytest.fixture
