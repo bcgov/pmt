@@ -1,9 +1,10 @@
+import asyncio
 from datetime import UTC, datetime
 
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import ResponseError
 
-from messaging.outbox.relay import OutboxRelay
+from messaging.outbox.relay import OutboxRelay, close_relay, get_relay
 
 
 class FakeRow:
@@ -180,3 +181,75 @@ async def test_an_empty_claim_publishes_nothing():
 
     assert await relay.drain_once() == 0
     assert producer.published == []
+
+
+async def test_notify_wakes_the_loop_before_the_poll_interval_elapses():
+    """
+    The nudge is a latency optimization only: it reaches the relay in this
+    process, so the poll interval is still the actual guarantee.
+    """
+    relay = OutboxRelay(producer=FakeProducer(), session_maker=lambda: FakeSession())
+    relay._repo_factory = lambda s: FakeRepo([])
+    relay.poll_interval_ms = 60_000  # long enough that only notify() can win
+
+    task = asyncio.create_task(relay.start())
+    await asyncio.sleep(0.05)
+    drains_before = relay.drain_count
+
+    relay.notify()
+    await asyncio.sleep(0.05)
+
+    assert relay.drain_count > drains_before
+
+    await relay.stop()
+    await asyncio.wait_for(task, timeout=5)
+
+
+async def test_stop_ends_the_loop():
+    relay = OutboxRelay(producer=FakeProducer(), session_maker=lambda: FakeSession())
+    relay._repo_factory = lambda s: FakeRepo([])
+    relay.poll_interval_ms = 10
+
+    task = asyncio.create_task(relay.start())
+    await asyncio.sleep(0.05)
+    await relay.stop()
+
+    await asyncio.wait_for(task, timeout=5)
+    assert relay.running is False
+
+
+async def test_a_drain_error_does_not_kill_the_loop():
+    """
+    A database blip must not silently end publishing for the process's life.
+    """
+    relay = OutboxRelay(producer=FakeProducer(), session_maker=lambda: FakeSession())
+    calls = {"n": 0}
+
+    async def exploding_drain():
+        calls["n"] += 1
+        raise RuntimeError("database is gone")
+
+    relay.drain_once = exploding_drain
+    relay.poll_interval_ms = 10
+
+    task = asyncio.create_task(relay.start())
+    await asyncio.sleep(0.1)
+    await relay.stop()
+    await asyncio.wait_for(task, timeout=5)
+
+    assert calls["n"] > 1
+
+
+async def test_get_relay_returns_one_instance_per_process():
+    await close_relay()
+    assert get_relay() is get_relay()
+    await close_relay()
+
+
+async def test_notify_before_start_is_safe():
+    """
+    create_order calls notify() unconditionally, including when RELAY_ENABLED
+    is false and nothing ever started a loop.
+    """
+    relay = OutboxRelay(producer=FakeProducer(), session_maker=lambda: FakeSession())
+    relay.notify()  # must not raise
