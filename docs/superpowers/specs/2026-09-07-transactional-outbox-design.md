@@ -204,9 +204,28 @@ Error classification, the one piece of judgement in the relay:
 Backoff is exponential from `OUTBOX_RETRY_BACKOFF_MS`, capped at
 `OUTBOX_MAX_BACKOFF_MS`.
 
-Publishing happens while the batch's row locks are held. This is an accepted
-tradeoff: it keeps claim-and-mark in one transaction, and batches are small.
-The README records it.
+One transaction covers the whole batch: the claim, every `XADD`, and every
+mark. This is an accepted tradeoff, and the README records its two
+consequences.
+
+The first is duplicate amplification. A crash after publishing some rows but
+before the batch commits rolls back every `published` mark in that batch, so
+all the already-published rows are published again on restart. The window is
+bounded by `OUTBOX_BATCH_SIZE`, which is the operator's lever: smaller batches
+duplicate less and cost more transactions.
+
+The second is transaction duration. The batch's `XADD` calls happen inside the
+open transaction, so a slow Redis holds a pooled connection — out of
+`pool_size=5, max_overflow=10`, shared with request handling — and holds back
+`VACUUM`'s cleanup horizon for as long as the batch runs. Lock contention is
+not the cost here: nothing contends for outbox rows except other relays, and
+`SKIP LOCKED` sends them straight past.
+
+Per-row transactions would cut the duplicate window to one event, but the
+batch claim is one round trip and the marks are one bulk `UPDATE` — about
+three round trips for a whole batch against two per row. The batch keeps that
+margin; `OUTBOX_BATCH_SIZE` trades it back when an operator wants a narrower
+window.
 
 Retention sweep runs on an `OUTBOX_SWEEP_INTERVAL_S` timer inside the same
 loop — no third background task:
@@ -257,7 +276,7 @@ A new "Outbox relay" block:
 | --- | --- | --- |
 | `RELAY_ENABLED` | `True` | start the relay in this process |
 | `OUTBOX_POLL_INTERVAL_MS` | `200` | idle wait when the nudge does not fire |
-| `OUTBOX_BATCH_SIZE` | `100` | rows claimed per transaction |
+| `OUTBOX_BATCH_SIZE` | `20` | rows claimed per transaction; also caps duplicate amplification |
 | `OUTBOX_RETRY_BACKOFF_MS` | `500` | base transport backoff |
 | `OUTBOX_MAX_BACKOFF_MS` | `30_000` | backoff cap |
 | `OUTBOX_RETENTION_HOURS` | `24` | age at which published rows are swept |
@@ -269,8 +288,10 @@ A new "Outbox relay" block:
 
 Unit (`make test`, no Docker):
 
-- `create_order` writes the order row and the outbox row and commits once,
-  with the producer never touched.
+- `create_order` writes the order row and the outbox row in one transaction
+  and commits exactly once, with no Redis interaction on the request path.
+  `OrderService` no longer has a producer to assert against, so the test
+  patches `get_producer` to raise and passes only if it is never called.
 - `create_order` calls `notify()` after a successful commit and not after a
   `DuplicateOrderError`.
 - Error classification: a fake producer raising `ConnectionError` leaves the
@@ -307,11 +328,17 @@ settings, and this residual-limitations list:
 
 - Delivery is at-least-once. A crash between `XADD` and the marking commit
   republishes the row; handlers must be idempotent.
+- A relay transaction covers an entire claimed batch, so that crash
+  republishes not just one row but every row already published in the batch.
+  Lower `OUTBOX_BATCH_SIZE` to narrow the window, at the cost of more database
+  transactions.
+- The batch's `XADD` calls run inside the open transaction, so a slow Redis
+  keeps a pooled connection checked out and delays `VACUUM` cleanup for the
+  duration of the batch.
 - Publish order is not guaranteed globally when more than one replica runs a
   relay. `SKIP LOCKED` lets a later row overtake an earlier one held by
   another relay. Per-aggregate ordering needs partitioning by
   `correlation_id`, which this template does not do.
-- `XADD` happens while the batch's row locks are held.
 - The relay shares the API's process and event loop. Splitting it into its own
   container is a deployment change, not a code change: it is already a
   self-contained module behind `RELAY_ENABLED`.
