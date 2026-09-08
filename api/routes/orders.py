@@ -18,14 +18,14 @@ async def create_order(
     request: CreateOrderRequest, db: AsyncSession = Depends(get_db)
 ) -> OrderResponse:
     """
-    Persist an order as `pending` and publish OrderCreated.
+    Persist an order as `pending` and queue OrderCreated in the outbox.
 
-    Returns 201 with status `pending` even when publishing fails: the row is
-    committed either way, and the consumer is what moves it to `confirmed`.
+    Both rows commit together, so a 201 means the event will be published.
+    The status is `pending` until the consumer confirms it.
     """
     service = OrderService(db)
     try:
-        order, message_id = await service.create_order(
+        order = await service.create_order(
             order_ref=request.order_ref,
             item=request.item,
             quantity=request.quantity,
@@ -33,10 +33,6 @@ async def create_order(
     except DuplicateOrderError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e)) from e
 
-    if message_id is None:
-        logger.warning(
-            "Order created without a published event", order_ref=order.order_ref
-        )
     return OrderResponse.model_validate(order)
 
 

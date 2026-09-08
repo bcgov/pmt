@@ -20,101 +20,127 @@ class FakeRepo:
         return self.created
 
 
+class FakeOutbox:
+    def __init__(self):
+        self.added = []
+
+    async def add(self, envelope):
+        self.added.append(envelope)
+        return envelope
+
+
 class FakeSession:
     def __init__(self, fail_commit=False):
-        self.committed = False
+        self.commits = 0
         self.rolled_back = False
         self.fail_commit = fail_commit
+
+    @property
+    def committed(self) -> bool:
+        return self.commits > 0
 
     async def commit(self):
         if self.fail_commit:
             raise IntegrityError("INSERT", {}, Exception("duplicate key"))
-        self.committed = True
+        self.commits += 1
 
     async def rollback(self):
         self.rolled_back = True
 
 
-class FakeProducer:
-    def __init__(self, fail=False):
-        self.fail = fail
-        self.published = []
+class FakeRelay:
+    def __init__(self):
+        self.notified = 0
 
-    async def publish(self, envelope):
-        if self.fail:
-            raise ConnectionError("redis is down")
-        self.published.append(envelope)
-        return "1-0"
+    def notify(self):
+        self.notified += 1
 
 
-def make_service(session=None, repo=None, producer=None):
-    service = OrderService(
-        session or FakeSession(), producer=producer or FakeProducer()
-    )
+@pytest.fixture
+def relay(monkeypatch):
+    """Replace the process-wide relay so notify() is observable."""
+    fake = FakeRelay()
+    monkeypatch.setattr("core.services.order_service.get_relay", lambda: fake)
+    return fake
+
+
+@pytest.fixture(autouse=True)
+def no_redis_on_the_request_path(monkeypatch):
+    """
+    create_order must not touch Redis at all. OrderService no longer takes a
+    producer, so guard the module-level accessor instead: any call fails.
+    """
+
+    def explode():
+        raise AssertionError("create_order must not touch Redis")
+
+    monkeypatch.setattr("messaging.producer.redis_producer.get_producer", explode)
+
+
+def make_service(session=None, repo=None, outbox=None):
+    service = OrderService(session or FakeSession())
     service.repo = repo or FakeRepo()
+    service.outbox = outbox or FakeOutbox()
     return service
 
 
-async def test_create_order_commits_then_publishes():
-    session, producer = FakeSession(), FakeProducer()
-    service = make_service(session=session, producer=producer)
+async def test_create_order_writes_both_rows_and_commits_exactly_once(relay):
+    session, outbox = FakeSession(), FakeOutbox()
+    service = make_service(session=session, outbox=outbox)
 
-    order, message_id = await service.create_order("r1", "widget", 2)
+    order = await service.create_order("r1", "widget", 2)
 
-    assert session.committed is True
-    assert message_id == "1-0"
-    assert len(producer.published) == 1
-    assert producer.published[0].payload.order_ref == "r1"
+    assert session.commits == 1
     assert order.status == "pending"
+    assert len(outbox.added) == 1
+    envelope = outbox.added[0]
+    assert envelope.event_type == "OrderCreated"
+    assert envelope.payload.order_ref == "r1"
+    assert envelope.correlation_id == "r1"
+    assert envelope.source == "api"
 
 
-async def test_publish_failure_keeps_the_committed_row_and_returns_no_id():
-    """
-    The commit and the XADD are not atomic. On publish failure the row
-    exists and the event does not, so the caller reports 201 + pending.
-    """
-    session, producer = FakeSession(), FakeProducer(fail=True)
-    service = make_service(session=session, producer=producer)
+async def test_create_order_nudges_the_relay_after_committing(relay):
+    service = make_service()
 
-    order, message_id = await service.create_order("r1", "widget", 2)
+    await service.create_order("r1", "widget", 2)
 
-    assert session.committed is True
-    assert session.rolled_back is False
-    assert message_id is None
-    assert order.status == "pending"
+    assert relay.notified == 1
 
 
-async def test_duplicate_order_ref_is_rejected_before_any_write():
+async def test_duplicate_order_ref_is_rejected_before_any_write(relay):
     existing = Order(order_ref="r1", item="widget", quantity=1, status="pending")
-    session, producer = FakeSession(), FakeProducer()
+    session, outbox = FakeSession(), FakeOutbox()
     service = make_service(
-        session=session, repo=FakeRepo(existing=existing), producer=producer
+        session=session, repo=FakeRepo(existing=existing), outbox=outbox
     )
 
     with pytest.raises(DuplicateOrderError):
         await service.create_order("r1", "widget", 2)
 
-    assert session.committed is False
-    assert producer.published == []
+    assert session.commits == 0
+    assert outbox.added == []
+    assert relay.notified == 0
 
 
-async def test_concurrent_duplicate_is_caught_by_the_unique_constraint():
+async def test_concurrent_duplicate_is_caught_by_the_unique_constraint(relay):
     """
     The get_by_ref check and the insert are not atomic: two concurrent
     requests can both pass the check, so the unique constraint is the real
-    guard. Its IntegrityError must map onto the same DuplicateOrderError.
+    guard. Its IntegrityError must map onto the same DuplicateOrderError, and
+    the outbox row rolls back with the order row.
     """
-    session, producer = FakeSession(fail_commit=True), FakeProducer()
-    service = make_service(session=session, producer=producer)
+    session = FakeSession(fail_commit=True)
+    service = make_service(session=session)
 
     with pytest.raises(DuplicateOrderError):
         await service.create_order("r1", "widget", 2)
 
     assert session.rolled_back is True
-    assert producer.published == []
+    assert relay.notified == 0
 
 
-async def test_get_order_delegates_to_the_repository():
+async def test_get_order_delegates_to_the_repository(relay):
     existing = Order(order_ref="r1", item="widget", quantity=1, status="pending")
     service = make_service(repo=FakeRepo(existing=existing))
 

@@ -4,8 +4,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from config.logging import get_logger
 from db.models import Order
 from db.repositories.order_repository import OrderRepository
+from db.repositories.outbox_repository import OutboxRepository
 from messaging.models import EventEnvelope, OrderCreatedEvent
-from messaging.producer.redis_producer import RedisProducer, get_producer
+from messaging.outbox.relay import get_relay
 
 logger = get_logger(__name__)
 
@@ -18,36 +19,24 @@ class OrderService:
     """
     Business logic for orders.
 
-    Sequencing note: the row is committed BEFORE the event is published.
-    The two are not atomic. If the publish fails the order stays `pending`
-    and no event exists — the caller surfaces that honestly rather than
-    pretending the write failed. A production service would use a
-    transactional outbox; see README.
+    Sequencing note: the order row and its event are written in ONE
+    transaction — the event goes to the `outbox` table, not to Redis. This
+    method never publishes. The relay does that, after the commit, which is
+    what makes "the row exists but the event does not" impossible.
     """
 
-    def __init__(self, session: AsyncSession, producer: RedisProducer | None = None):
+    def __init__(self, session: AsyncSession):
         self.session = session
         self.repo = OrderRepository(session)
-        self.producer = producer or get_producer()
+        self.outbox = OutboxRepository(session)
 
-    async def create_order(
-        self, order_ref: str, item: str, quantity: int
-    ) -> tuple[Order, str | None]:
+    async def create_order(self, order_ref: str, item: str, quantity: int) -> Order:
         if await self.repo.get_by_ref(order_ref) is not None:
             raise DuplicateOrderError(f"order_ref already exists: {order_ref}")
 
         order = await self.repo.create(
             order_ref=order_ref, item=item, quantity=quantity
         )
-        try:
-            await self.session.commit()
-        except IntegrityError as e:
-            # Two concurrent requests can both pass the check above; the
-            # unique constraint is the real guard, this just maps its
-            # failure onto the same 409 the explicit check raises.
-            await self.session.rollback()
-            raise DuplicateOrderError(f"order_ref already exists: {order_ref}") from e
-        logger.info("Order created", order_ref=order_ref, status=order.status)
 
         envelope = EventEnvelope.create(
             event_type="OrderCreated",
@@ -57,20 +46,25 @@ class OrderService:
             correlation_id=order_ref,
             source="api",
         )
+        await self.outbox.add(envelope)
 
         try:
-            message_id = await self.producer.publish(envelope)
-        except Exception as e:
-            # The row is committed. Report it as pending rather than lying.
-            logger.error(
-                "Order committed but event publish failed; order stays pending",
-                order_ref=order_ref,
-                error=str(e),
-                exc_info=True,
-            )
-            return order, None
+            await self.session.commit()
+        except IntegrityError as e:
+            # Two concurrent requests can both pass the check above; the
+            # unique constraint is the real guard, this just maps its
+            # failure onto the same 409 the explicit check raises. The outbox
+            # row rolls back with the order row — that is the point.
+            await self.session.rollback()
+            raise DuplicateOrderError(f"order_ref already exists: {order_ref}") from e
 
-        return order, message_id
+        logger.info("Order created", order_ref=order_ref, status=order.status)
+
+        # Latency only: wakes a relay in this process so the event does not
+        # wait out the poll interval. Harmless when RELAY_ENABLED is false.
+        get_relay().notify()
+
+        return order
 
     async def get_order(self, order_ref: str) -> Order | None:
         return await self.repo.get_by_ref(order_ref)
