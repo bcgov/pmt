@@ -118,7 +118,9 @@ async def db_session(migrated_db) -> AsyncGenerator[AsyncSession, None]:
     async with maker() as session:
         yield session
     async with engine.begin() as conn:
-        await conn.execute(text("TRUNCATE TABLE orders RESTART IDENTITY CASCADE"))
+        await conn.execute(
+            text("TRUNCATE TABLE orders, outbox RESTART IDENTITY CASCADE")
+        )
     await engine.dispose()
 
 
