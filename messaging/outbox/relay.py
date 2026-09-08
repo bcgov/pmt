@@ -64,10 +64,18 @@ class OutboxRelay:
 
     async def drain_once(self) -> int:
         """
-        Claim one batch and publish it. Returns the number of rows claimed —
-        zero means the loop should go back to waiting.
+        Claim one batch and publish it. Returns the number of rows that
+        reached a terminal state this pass (published or failed) — NOT the
+        number claimed. A row that stalls the batch on a transport error
+        (see below) is neither published nor failed, so it does not count.
+
+        Zero means no progress was made this pass — either nothing was
+        pending, or the batch stalled immediately on a transport error —
+        and the loop should go back to waiting either way, rather than
+        busy-spinning against an unreachable Redis.
         """
         self.drain_count += 1
+        processed = 0
         session_maker = self.session_maker
         async with session_maker() as session:
             async with session.begin():
@@ -80,6 +88,7 @@ class OutboxRelay:
                         # failed row rather than crashing the relay.
                         await repo.mark_failed(row, "empty payload")
                         logger.error("Outbox row has no payload", outbox_id=row.id)
+                        processed += 1
                         continue
 
                     try:
@@ -100,7 +109,10 @@ class OutboxRelay:
                                 error=str(exc),
                             )
                             # Redis is unreachable for every row, not just
-                            # this one. Stop, and keep publish order.
+                            # this one. Stop, and keep publish order. This
+                            # row stays pending, so it does not count toward
+                            # processed — the caller must back off instead
+                            # of immediately re-claiming it.
                             break
 
                         await repo.mark_failed(row, str(exc))
@@ -111,11 +123,13 @@ class OutboxRelay:
                             exc_info=True,
                         )
                         # One unpublishable row must not block the rest.
+                        processed += 1
                         continue
 
                     await repo.mark_published(row)
+                    processed += 1
 
-                return len(rows)
+                return processed
 
     # ------------------------------------------------------------------
     # Loop
@@ -135,19 +149,23 @@ class OutboxRelay:
 
         while self.running:
             try:
-                claimed = await self.drain_once()
+                processed = await self.drain_once()
             except Exception as e:
                 # A database blip must not end publishing for the life of the
                 # process. Log it and keep looping.
                 logger.error("Outbox drain failed", error=str(e), exc_info=True)
-                claimed = 0
+                processed = 0
 
             try:
                 await self._maybe_sweep()
             except Exception as e:
                 logger.error("Outbox sweep failed", error=str(e), exc_info=True)
 
-            if claimed == 0:
+            # A 0 here means no progress this pass — nothing was pending, or
+            # the batch stalled immediately on a transport error — either
+            # way, wait instead of busy-spinning against an unreachable
+            # Redis.
+            if processed == 0:
                 await self._wait_for_work()
 
         logger.info("Outbox relay stopped")

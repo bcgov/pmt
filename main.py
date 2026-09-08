@@ -49,6 +49,8 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Redis Stream consumer started")
 
+    relay = None
+    relay_task = None
     if get_settings().RELAY_ENABLED:
         relay = get_relay()
         relay_task = asyncio.create_task(relay.start())

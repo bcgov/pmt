@@ -175,6 +175,24 @@ async def test_empty_payload_is_a_permanent_integrity_failure():
     assert producer.published == []
 
 
+async def test_stalled_batch_on_transport_failure_reports_no_progress():
+    """
+    When Redis is down, the first row's transport failure stops the batch
+    with nothing reaching a terminal state. drain_once must report 0 so the
+    loop waits instead of immediately re-claiming and busy-spinning.
+    """
+    rows = [FakeRow(1), FakeRow(2), FakeRow(3)]
+    producer = FakeProducer(raise_on=0, exc=RedisConnectionError("down"))
+    relay, _ = make_relay(rows, producer)
+
+    processed = await relay.drain_once()
+
+    assert processed == 0
+    assert rows[0].status == "pending"
+    assert rows[1].status == "pending"
+    assert rows[2].status == "pending"
+
+
 async def test_an_empty_claim_publishes_nothing():
     producer = FakeProducer()
     relay, session = make_relay([], producer)

@@ -113,4 +113,7 @@ class OutboxEvent(Base):
     )
 
     def __repr__(self) -> str:
-        return f"<OutboxEvent(id={self.id}, type={self.event_type}, status={self.status})>"
+        return (
+            f"<OutboxEvent(id={self.id}, type={self.event_type}, "
+            f"status={self.status})>"
+        )
