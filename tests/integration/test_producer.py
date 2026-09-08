@@ -29,3 +29,24 @@ async def test_publish_writes_one_message_with_event_field(app_settings, redis_c
     assert EventEnvelope.model_validate_json(fields["event"]).payload == env.payload
 
     await producer.close()
+
+
+async def test_publish_raw_writes_the_string_through_untouched(
+    app_settings, redis_client
+):
+    """
+    The outbox relay publishes stored bytes it never parsed. Whatever string
+    goes in must come out on the stream identically.
+    """
+    from messaging.producer.redis_producer import RedisProducer
+
+    producer = RedisProducer()
+    exact = '{"b": 1, "a": 2,   "c": [1.10, 2.0]}'
+
+    message_id = await producer.publish_raw(exact)
+
+    entries = await redis_client.xrange(app_settings.STREAM_NAME)
+    assert len(entries) == 1
+    assert entries[0][0] == message_id
+    assert entries[0][1]["event"] == exact
+    await producer.close()

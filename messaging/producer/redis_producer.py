@@ -19,20 +19,22 @@ class RedisProducer:
         self.redis = Redis.from_url(settings.REDIS_STREAM_URL, decode_responses=True)
         self.stream_name = settings.STREAM_NAME
 
-    async def publish(self, envelope: EventEnvelope) -> str:
+    async def publish_raw(self, payload: str) -> str:
         """
-        Publish one envelope. Message shape is {"event": "<json>"} — the
-        consumer reads the same key.
+        Publish an already-serialized envelope.
+
+        The outbox relay uses this: it moves a stored string to Redis without
+        ever parsing it, so the bytes the writer produced are the bytes that
+        reach the stream. Message shape is {"event": "<json>"} — the consumer
+        reads the same key.
         """
         try:
             message_id = await self.redis.xadd(
                 name=self.stream_name,
-                fields={"event": envelope.model_dump_json()},
+                fields={"event": payload},
             )
             logger.info(
                 "Event published",
-                event_id=str(envelope.event_id),
-                event_type=envelope.event_type,
                 stream=self.stream_name,
                 message_id=message_id,
             )
@@ -40,11 +42,15 @@ class RedisProducer:
         except Exception as e:
             logger.error(
                 "Failed to publish event",
-                event_type=envelope.event_type,
+                stream=self.stream_name,
                 error=str(e),
                 exc_info=True,
             )
             raise
+
+    async def publish(self, envelope: EventEnvelope) -> str:
+        """Serialize an envelope and publish it. One XADD call site: publish_raw."""
+        return await self.publish_raw(envelope.model_dump_json())
 
     async def close(self) -> None:
         await self.redis.aclose()
