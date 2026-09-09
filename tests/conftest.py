@@ -53,7 +53,7 @@ def seaweedfs_url() -> str:
     from testcontainers.core.waiting_utils import wait_for_logs
 
     container = (
-        DockerContainer("chrislusf/seaweedfs:4.44")
+        DockerContainer("chrislusf/seaweedfs:4.46")
         .with_command(
             "server -dir=/data -s3 -s3.port=8333 -volume.max=100 "
             "-master.volumeSizeLimitMB=100 -master.volumePreallocate=false"
