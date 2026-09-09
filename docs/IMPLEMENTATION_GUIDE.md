@@ -324,7 +324,7 @@ sequenceDiagram
     DB-->>Route: Commit succeeds
     Route-->>Relay: notify() in this process
     Route-->>Client: 201 pending
-    Note over Relay,Redis: Independent asynchronous work; may overlap HTTP response
+    Note over Relay,Redis: Independent asynchronous work#59; may overlap HTTP response
     Relay->>DB: BEGIN / claim due rows FOR UPDATE SKIP LOCKED
     loop Claimed batch
         Relay->>Redis: XADD stored event
@@ -614,7 +614,7 @@ sequenceDiagram
     Note over A: Crashes before XACK
     Note over Redis: Pending entry becomes idle
     B->>Redis: XAUTOCLAIM with minimum idle time
-    Redis-->>B: Reassign eligible entry; increase delivery count
+    Redis-->>B: Reassign eligible entry#59; increase delivery count
     B->>Redis: XPENDING details for entry
     alt Delivery count exceeds configured limit
         B->>Redis: XADD poison_message to DLQ
